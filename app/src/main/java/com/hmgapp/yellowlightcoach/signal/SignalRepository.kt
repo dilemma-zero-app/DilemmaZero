@@ -33,12 +33,39 @@ class SignalRepository(
         intersections = api.fetchIntersections(stdgCd).associateBy { it.id }
     }
 
+    /**
+     * 교차로별 카운트다운 기준 시각 (부팅 후 경과 ms)
+     *
+     * API의 남은 시간은 "받은 순간"이 아니라 "regDt(신호 기록 시각)" 기준 값이다.
+     * 지연이 0~3초로 들쭉날쭉하므로, 받은 시각이 아니라 regDt부터 빼야 정확하다.
+     *   기준 = 받은 시각 − 지연(받은 실제 시각 − regDt)
+     * regDt는 초 단위로 잘려 있어 최대 1초 더 빼게 되는데,
+     * 그러면 녹색이 실제보다 짧게 보여 "더 일찍 조심"하는 쪽이라 안전하다.
+     * 기기 시계가 이상해서 지연이 말이 안 되는 값이면(−1초 미만, 10초 초과) 받은 시각을 쓴다.
+     */
+    @Volatile private var baseElapsedById: Map<String, Long> = emptyMap()
+
     suspend fun refreshSignals() = withContext(Dispatchers.IO) {
         val list = api.fetchSignals(stdgCd)
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val nowWall = System.currentTimeMillis()
+        baseElapsedById = list.associate { s ->
+            val lag = nowWall - s.regDtEpochMs
+            val base = if (s.regDtEpochMs > 0 && lag in -1_000L..10_000L) {
+                nowElapsed - lag.coerceAtLeast(0L)
+            } else {
+                nowElapsed
+            }
+            s.id to base
+        }
         snapshot = list.associateBy { it.id }
-        receivedAtElapsed = SystemClock.elapsedRealtime()
-        receivedAtWall = System.currentTimeMillis()
+        receivedAtElapsed = nowElapsed
+        receivedAtWall = nowWall
     }
+
+    /** 이 교차로에서 신호 정보가 있는 진입 방향들 */
+    fun approachesWithSignal(id: String): Set<Approach> =
+        snapshot[id]?.signals?.keys?.map { it.first }?.toSet() ?: emptySet()
 
     /** 데이터 지연(초) = 받은 시각 − regDt. regDt는 초 단위라 ±1초 오차 */
     fun dataLagSec(): Double? {
@@ -55,7 +82,8 @@ class SignalRepository(
         nowElapsed: Long = SystemClock.elapsedRealtime()
     ): SignalState? {
         val s = snapshot[id]?.signals?.get(approach to movement) ?: return null
-        val remaining = s.remainingMs?.let { it - (nowElapsed - receivedAtElapsed) }
+        val base = baseElapsedById[id] ?: receivedAtElapsed
+        val remaining = s.remainingMs?.let { it - (nowElapsed - base) }
         return SignalState(s.phase, remaining)
     }
 

@@ -7,6 +7,7 @@ import ai.pleos.playground.vehicle.listener.BrakePedalStatusListener
 import ai.pleos.playground.vehicle.listener.GearSelectionListener
 import ai.pleos.playground.vehicle.listener.SteeringWheelAngleListener
 import ai.pleos.playground.vehicle.listener.TurnSignalStateListener
+import android.Manifest
 import android.car.Car
 import android.car.VehiclePropertyIds
 import android.car.drivingstate.CarUxRestrictions
@@ -47,6 +48,11 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.hmgapp.yellowlightcoach.location.Ahead
+import com.hmgapp.yellowlightcoach.location.AheadFinder
+import com.hmgapp.yellowlightcoach.location.Fix
+import com.hmgapp.yellowlightcoach.location.Geo
+import com.hmgapp.yellowlightcoach.location.LocationTracker
 import com.hmgapp.yellowlightcoach.signal.Approach
 import com.hmgapp.yellowlightcoach.signal.Movement
 import com.hmgapp.yellowlightcoach.signal.Phase
@@ -62,7 +68,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 2단계 테스트 화면: 공공 신호 API 연동
+ * 2단계 테스트 화면: 공공 신호 API 연동 + 위치로 앞 교차로 찾기
  *
  *  - 울산 교차로 목록을 한 번 받고
  *  - 신호는 10초마다 받으며, 그 사이엔 앱 안에서 1초씩 카운트다운
@@ -101,6 +107,12 @@ class MainActivity : ComponentActivity() {
     private var speedSubscribed = false
     private val speedText = mutableStateOf("꺼짐")
     private val uxText = mutableStateOf("-")
+
+    // ---------- 위치 ----------
+    private lateinit var tracker: LocationTracker
+    private val fix = mutableStateOf<Fix?>(null)
+    private val ahead = mutableStateOf<Ahead?>(null)
+    private val locationText = mutableStateOf("꺼짐")
 
     private val logs = mutableStateListOf<String>()
 
@@ -141,6 +153,12 @@ class MainActivity : ComponentActivity() {
             log("CAR_SPEED 권한 ${if (granted) "허용" else "거부"}")
             if (granted) subscribeSpeed()
         }
+    private val locationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            val granted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true
+            log("위치 권한 ${if (granted) "허용" else "거부"}")
+            if (granted) startTracker()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -153,6 +171,8 @@ class MainActivity : ComponentActivity() {
         vehicle.getBrake().registerBrakePedalStatus(brakeListener)
         vehicle.getSteeringWheel().registerSteeringWheelAngle(steeringListener)
         vehicle.getTurnSignal().registerTurnSignalState(turnSignalListener)
+
+        tracker = LocationTracker(this) { f -> onFix(f) }
 
         startSignalLoop()
 
@@ -179,6 +199,7 @@ class MainActivity : ComponentActivity() {
                     try {
                         repo.loadIntersections()
                         log("교차로 ${repo.intersections.size}개 받음")
+                        logCorridorCoords()
                     } catch (e: Exception) {
                         log("교차로 받기 실패: ${e.message}")
                     }
@@ -209,20 +230,70 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 시연 구간 신호 중 남은 시간이 0 이하가 된 게 있는지 */
-    private fun anyCorridorSignalChanged(now: Long): Boolean =
-        corridor.any { (id, _) ->
-            listOf(Approach.W, Approach.E).any { a ->
-                val r = repo.current(id, a, Movement.STRAIGHT, now)?.remainingMs
+    /** 시연 구간 + 앞 교차로 신호 중 남은 시간이 0 이하가 된 게 있는지 */
+    private fun anyCorridorSignalChanged(now: Long): Boolean {
+        val a = ahead.value
+        if (a != null) {
+            val r = repo.current(a.intersection.id, a.approach, Movement.STRAIGHT, now)?.remainingMs
+            if (r != null && r <= 0) return true
+        }
+        return corridor.any { (id, _) ->
+            listOf(Approach.W, Approach.E).any { ap ->
+                val r = repo.current(id, ap, Movement.STRAIGHT, now)?.remainingMs
                 r != null && r <= 0
             }
         }
+    }
 
     private fun updateStatus() {
         val time = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date(repo.receivedAtWall))
         val lag = repo.dataLagSec()?.let { "%.0f초".format(it) } ?: "?"
         signalStatus.value =
             "✅ 신호 ${repo.snapshot.size}개 · 받은 시각 $time · 데이터 지연 $lag · 호출 ${repo.callCount}회"
+    }
+
+    // ================= 위치 =================
+
+    private fun startLocation() {
+        val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+        if (fine == PackageManager.PERMISSION_GRANTED) {
+            startTracker()
+        } else {
+            // 권한 창은 주차(P) 상태에서만 (주행 중엔 차단됨)
+            locationPermissionLauncher.launch(
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+            )
+        }
+    }
+
+    private fun startTracker() {
+        val ok = tracker.start()
+        locationText.value = if (ok) "위치 기다리는 중…" else "❌ GPS가 꺼져 있어요"
+        log(if (ok) "위치 받기 시작" else "GPS 꺼짐")
+    }
+
+    private fun onFix(f: Fix) {
+        fix.value = f
+        val head = f.headingDeg?.let { "%s %.0f°".format(Geo.compass(it), it) } ?: "모름(움직이면 계산)"
+        locationText.value = "%.6f, %.6f · 진행 방향 %s".format(f.lat, f.lon, head)
+        val newAhead = AheadFinder.find(
+            f, repo.intersections.values, { id -> repo.approachesWithSignal(id) }, ahead.value
+        )
+        if (newAhead?.intersection?.id != ahead.value?.intersection?.id) {
+            log(
+                newAhead?.let { "앞 교차로: ${it.intersection.name} (%.0fm 앞, 옆 %.0fm, ${it.approach.prefix})".format(it.distanceM, it.lateralM) }
+                    ?: "앞 교차로: 없음"
+            )
+        }
+        ahead.value = newAhead
+    }
+
+    /** 테스트 경로(GPX) 만들기용: 시연 구간 교차로 좌표를 Logcat에 출력 */
+    private fun logCorridorCoords() {
+        corridor.forEach { (id, name) ->
+            val x = repo.intersections[id] ?: return@forEach
+            Log.d(tag, "COORD $id,$name,${x.lat},${x.lon}")
+        }
     }
 
     // ================= Car API =================
@@ -267,6 +338,7 @@ class MainActivity : ComponentActivity() {
         if (speedSubscribed) propertyManager?.unregisterCallback(speedCallback)
         uxManager?.unregisterListener()
         car?.disconnect()
+        tracker.stop()
         super.onDestroy()
     }
 
@@ -330,7 +402,31 @@ class MainActivity : ComponentActivity() {
                         "깜빡이 ${turnSignalText.value}  ·  속도 ${speedText.value}  ·  주행 제한 ${uxText.value}",
                 fontSize = 15.sp
             )
-            Button(onClick = { startCarSpeed() }) { Text("차량 속도 켜기 (P에서)") }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(onClick = { startCarSpeed() }) { Text("차량 속도 켜기 (P에서)") }
+                Button(onClick = { startLocation() }) { Text("위치 켜기 (P에서)") }
+            }
+
+            // 앞 교차로
+            Spacer(Modifier.height(4.dp))
+            Text("현재 위치: ${locationText.value}", fontSize = 15.sp)
+            val a = ahead.value
+            if (a == null) {
+                Text("앞 교차로: 없음 (500m 안, 내 진행선 ±35m)", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            } else {
+                val ap = a.approach
+                val sig = repo.current(a.intersection.id, ap, Movement.STRAIGHT, now)
+                Text(
+                    "앞 교차로: ${a.intersection.name} (${a.intersection.id}) · 중심까지 %.0fm · 옆으로 %.0fm"
+                        .format(a.distanceM, a.lateralM),
+                    fontSize = 17.sp, fontWeight = FontWeight.Bold
+                )
+                Text(
+                    "진입 방향: ${ap.label}쪽(${ap.prefix}) · 직진 신호 ${signalLabel(sig)}",
+                    fontSize = 17.sp, fontWeight = FontWeight.Bold,
+                    color = phaseColor(sig?.phase ?: Phase.UNKNOWN)
+                )
+            }
 
             Spacer(Modifier.height(4.dp))
             Text(signalStatus.value, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
