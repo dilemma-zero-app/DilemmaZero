@@ -63,6 +63,14 @@ class SignalRepository(
         receivedAtWall = nowWall
     }
 
+    /** 이 교차로·진입 방향에 이 종류(직진/좌회전) 신호가 있는지 */
+    fun hasSignal(id: String, approach: Approach, movement: Movement): Boolean =
+        snapshot[id]?.signals?.containsKey(approach to movement) == true
+
+    /** 마지막으로 신호를 받은 뒤 지난 시간(ms). 한 번도 못 받았으면 Long.MAX_VALUE */
+    fun dataAgeMs(nowElapsed: Long = SystemClock.elapsedRealtime()): Long =
+        if (receivedAtElapsed == 0L) Long.MAX_VALUE else nowElapsed - receivedAtElapsed
+
     /** 이 교차로에서 신호 정보가 있는 진입 방향들 */
     fun approachesWithSignal(id: String): Set<Approach> =
         snapshot[id]?.signals?.keys?.map { it.first }?.toSet() ?: emptySet()
