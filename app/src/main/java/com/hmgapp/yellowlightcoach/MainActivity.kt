@@ -9,13 +9,13 @@ import ai.pleos.playground.vehicle.listener.SteeringWheelAngleListener
 import ai.pleos.playground.vehicle.listener.TurnSignalStateListener
 import android.car.Car
 import android.car.VehiclePropertyIds
-import android.car.content.pm.CarPackageManager
 import android.car.drivingstate.CarUxRestrictions
 import android.car.drivingstate.CarUxRestrictionsManager
 import android.car.hardware.CarPropertyValue
 import android.car.hardware.property.CarPropertyManager
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -30,6 +30,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -37,56 +39,74 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.hmgapp.yellowlightcoach.signal.Approach
+import com.hmgapp.yellowlightcoach.signal.Movement
+import com.hmgapp.yellowlightcoach.signal.Phase
+import com.hmgapp.yellowlightcoach.signal.SignalApi
+import com.hmgapp.yellowlightcoach.signal.SignalRepository
+import com.hmgapp.yellowlightcoach.signal.SignalState
 import com.hmgapp.yellowlightcoach.ui.theme.YellowLightCoachTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * 2단계 실험 화면: Car API를 켜면 주행 중 앱이 차단되는 원인 찾기
+ * 2단계 테스트 화면: 공공 신호 API 연동
  *
- * 버튼으로 Car API를 한 단계씩 켜고, 매번 기어 P → D로 바꿔서
- * 앱 화면이 계속 보이는지 확인한다.
- *   ① Car 연결 (+ 시스템이 우리 앱을 "주행 중 안전한 앱(DO)"으로 보는지 확인)
- *   ② 속도 구독 시작
- *   ③ 속도 구독 중지
- *   ④ Car 연결 해제
- * 차단되면 화면이 안 보이므로, 무슨 일이 있었는지는 아래 "기록"에 남긴다. (P로 돌아오면 확인)
+ *  - 울산 교차로 목록을 한 번 받고
+ *  - 신호는 10초마다 받으며, 그 사이엔 앱 안에서 1초씩 카운트다운
+ *  - 신호가 바뀌는 순간(남은 시간 0)엔 바로 다시 받기 (최소 3초 간격)
+ *  - 시연 구간(공업탑로터리 → 터미널사거리) 10개 교차로의 직진 신호 표시
+ *    · 서→동으로 달리면 서쪽(wt)에서 진입 → wt 신호
+ *    · 동→서로 달리면 동쪽(et)에서 진입 → et 신호
  */
 class MainActivity : ComponentActivity() {
 
     private val tag = "YLC"
 
+    // ---------- 시연 구간 (서 → 동 순서) ----------
+    private val corridor = listOf(
+        "109" to "공업탑로터리", "12" to "울산남부경찰서", "5" to "달동사거리",
+        "229" to "태화신협앞", "11" to "파크랜드", "6" to "동평중학교입구",
+        "2" to "번영사거리", "10" to "목화예식장", "7" to "현대백화점사거리", "8" to "터미널사거리"
+    )
+
+    // ---------- 신호 ----------
+    private val repo = SignalRepository(SignalApi(BuildConfig.SIGNAL_API_KEY))
+    private val tick = mutableStateOf(0L)              // 화면 카운트다운 갱신용
+    private val signalStatus = mutableStateOf("준비 중…")
+
     // ---------- Pleos Vehicle SDK ----------
     private lateinit var vehicle: Vehicle
-
-    // ---------- 안드로이드 표준 Car API ----------
-    private var car: Car? = null
-    private var propertyManager: CarPropertyManager? = null
-    private var uxManager: CarUxRestrictionsManager? = null
-    private var speedSubscribed = false
-
-    // ---------- 화면 값 ----------
     private val gearText = mutableStateOf("-")
     private val brakeText = mutableStateOf("-")
     private val steeringText = mutableStateOf("-")
     private val turnSignalText = mutableStateOf("-")
-    private val carText = mutableStateOf("연결 안 함")
-    private val speedText = mutableStateOf("구독 안 함")
-    private val doText = mutableStateOf("-")
+
+    // ---------- AAOS Car API (속도, 주행 제한) ----------
+    private var car: Car? = null
+    private var propertyManager: CarPropertyManager? = null
+    private var uxManager: CarUxRestrictionsManager? = null
+    private var speedSubscribed = false
+    private val speedText = mutableStateOf("꺼짐")
     private val uxText = mutableStateOf("-")
+
     private val logs = mutableStateListOf<String>()
 
     // ---------- Vehicle SDK 리스너 ----------
     private val gearListener = object : GearSelectionListener {
-        override fun onSelected(gear: VehicleGear?) = ui {
-            gearText.value = gearLabel(gear)
-            log("기어 → ${gearLabel(gear)}")
-        }
+        override fun onSelected(gear: VehicleGear?) = ui { gearText.value = gearLabel(gear) }
         override fun onFailed(e: Exception) = log("기어 오류: ${e.message}")
     }
     private val brakeListener = object : BrakePedalStatusListener {
@@ -113,14 +133,9 @@ class MainActivity : ComponentActivity() {
         }
         override fun onErrorEvent(propId: Int, zone: Int) = log("속도 오류 propId=$propId")
     }
-
     private val uxListener = CarUxRestrictionsManager.OnUxRestrictionsChangedListener { r ->
-        ui {
-            uxText.value = uxLabel(r)
-            log("주행 제한 변경 → ${uxLabel(r)}")
-        }
+        ui { uxText.value = uxLabel(r) }
     }
-
     private val speedPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             log("CAR_SPEED 권한 ${if (granted) "허용" else "거부"}")
@@ -139,6 +154,8 @@ class MainActivity : ComponentActivity() {
         vehicle.getSteeringWheel().registerSteeringWheelAngle(steeringListener)
         vehicle.getTurnSignal().registerTurnSignalState(turnSignalListener)
 
+        startSignalLoop()
+
         setContent {
             YellowLightCoachTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -148,88 +165,113 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ① Car 연결 + DO 인정 여부 + 주행 제한 상태 확인
-    private fun connectCar() {
-        if (car != null) { log("이미 Car 연결됨"); return }
-        try {
-            val c = Car.createCar(this)
-            car = c
-            carText.value = "✅ 연결됨"
-            log("① Car 연결")
+    // ================= 신호 받기 루프 =================
 
-            // 시스템이 우리 화면을 "주행 중 안전한 화면(DO)"으로 보는지
-            val pm = c.getCarManager(Car.PACKAGE_SERVICE) as? CarPackageManager
-            val isDo = pm?.isActivityDistractionOptimized(packageName, MainActivity::class.java.name)
-            doText.value = when (isDo) {
-                true -> "✅ 인정됨"
-                false -> "❌ 인정 안 됨"
-                null -> "확인 불가"
+    private fun startSignalLoop() {
+        if (BuildConfig.SIGNAL_API_KEY.isBlank()) {
+            signalStatus.value = "❌ local.properties에 SIGNAL_API_KEY가 없어요"
+            return
+        }
+        lifecycleScope.launch {
+            // 화면이 보일 때만 동작 (안 보이면 멈춰서 호출 한도 아끼기)
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                if (repo.intersections.isEmpty()) {
+                    try {
+                        repo.loadIntersections()
+                        log("교차로 ${repo.intersections.size}개 받음")
+                    } catch (e: Exception) {
+                        log("교차로 받기 실패: ${e.message}")
+                    }
+                }
+                var nextRefresh = 0L
+                var lastRefresh = 0L
+                while (isActive) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now >= nextRefresh) {
+                        try {
+                            repo.refreshSignals()
+                            lastRefresh = SystemClock.elapsedRealtime()
+                            updateStatus()
+                        } catch (e: Exception) {
+                            signalStatus.value = "❌ 신호 받기 실패: ${e.message}"
+                            log("신호 받기 실패: ${e.message}")
+                        }
+                        nextRefresh = SystemClock.elapsedRealtime() + REFRESH_MS
+                    } else if (now - lastRefresh > MIN_GAP_MS && anyCorridorSignalChanged(now)) {
+                        // 화면에 보이는 신호가 바뀌는 순간 → 다음 신호 길이를 알려면 바로 다시 받기
+                        nextRefresh = now
+                        continue
+                    }
+                    tick.value = now
+                    delay(250)
+                }
             }
-            log("DO 인정 여부: ${doText.value}")
-
-            // 현재 주행 제한 상태 + 변화 구독
-            uxManager = c.getCarManager(Car.CAR_UX_RESTRICTION_SERVICE) as? CarUxRestrictionsManager
-            uxManager?.currentCarUxRestrictions?.let { uxText.value = uxLabel(it) }
-            uxManager?.registerListener(uxListener)
-
-            propertyManager = c.getCarManager(Car.PROPERTY_SERVICE) as? CarPropertyManager
-        } catch (e: Exception) {
-            log("① 실패: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
-    // ② 속도 구독 시작 (권한 없으면 요청 — 반드시 P에서)
-    private fun startSpeed() {
-        if (car == null) { log("먼저 ① Car 연결을 누르세요"); return }
-        if (ContextCompat.checkSelfPermission(this, Car.PERMISSION_SPEED)
-            == PackageManager.PERMISSION_GRANTED
-        ) subscribeSpeed() else speedPermissionLauncher.launch(Car.PERMISSION_SPEED)
+    /** 시연 구간 신호 중 남은 시간이 0 이하가 된 게 있는지 */
+    private fun anyCorridorSignalChanged(now: Long): Boolean =
+        corridor.any { (id, _) ->
+            listOf(Approach.W, Approach.E).any { a ->
+                val r = repo.current(id, a, Movement.STRAIGHT, now)?.remainingMs
+                r != null && r <= 0
+            }
+        }
+
+    private fun updateStatus() {
+        val time = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date(repo.receivedAtWall))
+        val lag = repo.dataLagSec()?.let { "%.0f초".format(it) } ?: "?"
+        signalStatus.value =
+            "✅ 신호 ${repo.snapshot.size}개 · 받은 시각 $time · 데이터 지연 $lag · 호출 ${repo.callCount}회"
+    }
+
+    // ================= Car API =================
+
+    private fun startCarSpeed() {
+        if (car == null) {
+            try {
+                val c = Car.createCar(this)
+                car = c
+                propertyManager = c.getCarManager(Car.PROPERTY_SERVICE) as? CarPropertyManager
+                uxManager = c.getCarManager(Car.CAR_UX_RESTRICTION_SERVICE) as? CarUxRestrictionsManager
+                uxManager?.currentCarUxRestrictions?.let { uxText.value = uxLabel(it) }
+                uxManager?.registerListener(uxListener)
+            } catch (e: Exception) {
+                log("Car 연결 실패: ${e.message}")
+                return
+            }
+        }
+        // 권한 요청은 반드시 주차(P) 상태에서 (주행 중엔 권한 창이 차단됨)
+        if (ContextCompat.checkSelfPermission(this, Car.PERMISSION_SPEED) == PackageManager.PERMISSION_GRANTED) {
+            subscribeSpeed()
+        } else {
+            speedPermissionLauncher.launch(Car.PERMISSION_SPEED)
+        }
     }
 
     private fun subscribeSpeed() {
-        try {
-            val ok = propertyManager?.registerCallback(
-                speedCallback, VehiclePropertyIds.PERF_VEHICLE_SPEED, CarPropertyManager.SENSOR_RATE_NORMAL
-            ) ?: false
-            speedSubscribed = ok
-            speedText.value = if (ok) "구독 중…" else "❌ 구독 실패"
-            log("② 속도 구독 ${if (ok) "시작" else "실패"}")
-        } catch (e: Exception) {
-            log("② 실패: ${e.javaClass.simpleName}: ${e.message}")
-        }
-    }
-
-    // ③ 속도 구독 중지
-    private fun stopSpeed() {
-        if (!speedSubscribed) { log("속도 구독 중이 아님"); return }
-        propertyManager?.unregisterCallback(speedCallback)
-        speedSubscribed = false
-        speedText.value = "구독 안 함"
-        log("③ 속도 구독 중지")
-    }
-
-    // ④ Car 연결 해제
-    private fun disconnectCar() {
-        if (speedSubscribed) stopSpeed()
-        uxManager?.unregisterListener()
-        car?.disconnect()
-        car = null; propertyManager = null; uxManager = null
-        carText.value = "연결 안 함"; doText.value = "-"; uxText.value = "-"
-        log("④ Car 연결 해제")
+        if (speedSubscribed) return
+        val ok = propertyManager?.registerCallback(
+            speedCallback, VehiclePropertyIds.PERF_VEHICLE_SPEED, CarPropertyManager.SENSOR_RATE_NORMAL
+        ) ?: false
+        speedSubscribed = ok
+        speedText.value = if (ok) "받는 중…" else "❌ 구독 실패"
     }
 
     override fun onDestroy() {
-        log("앱 종료(onDestroy)")
         vehicle.getGear().unregisterGearSelection(gearListener)
         vehicle.getBrake().unregisterBrakePedalStatus(brakeListener)
         vehicle.getSteeringWheel().unregisterSteeringWheelAngle(steeringListener)
         vehicle.getTurnSignal().unregisterTurnSignalState(turnSignalListener)
         vehicle.release()
-        disconnectCar()
+        if (speedSubscribed) propertyManager?.unregisterCallback(speedCallback)
+        uxManager?.unregisterListener()
+        car?.disconnect()
         super.onDestroy()
     }
 
-    // ---------- 도우미 ----------
+    // ================= 도우미 =================
+
     private fun ui(block: () -> Unit) = runOnUiThread(block)
 
     private fun log(msg: String) {
@@ -237,7 +279,7 @@ class MainActivity : ComponentActivity() {
         val time = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date())
         ui {
             logs.add(0, "$time  $msg")
-            if (logs.size > 12) logs.removeAt(logs.lastIndex)
+            if (logs.size > 6) logs.removeAt(logs.lastIndex)
         }
     }
 
@@ -250,41 +292,76 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun uxLabel(r: CarUxRestrictions): String =
-        if (!r.isRequiresDistractionOptimization) "제한 없음"
-        else "제한 중 (active=${r.activeRestrictions})"
+        if (!r.isRequiresDistractionOptimization) "제한 없음" else "제한 중(${r.activeRestrictions})"
 
-    // ---------- 화면 ----------
+    private fun phaseColor(p: Phase) = when (p) {
+        Phase.GREEN -> Color(0xFF2E9D5B)
+        Phase.YELLOW -> Color(0xFFE0A400)
+        Phase.RED -> Color(0xFFC8392F)
+        Phase.UNKNOWN -> Color.Gray
+    }
+
+    private fun signalLabel(s: SignalState?): String {
+        if (s == null) return "-"
+        val r = s.remainingMs
+        val sec = when {
+            r == null -> "?"
+            r <= 0 -> "전환 중"
+            else -> "${(r + 999) / 1000}초"
+        }
+        return "${s.phase.label} $sec"
+    }
+
+    // ================= 화면 =================
+
     @Composable
     private fun TestScreen(modifier: Modifier) {
+        val now = tick.value   // 0.25초마다 바뀌어서 카운트다운이 다시 그려짐
         Column(
-            modifier = modifier.fillMaxSize().padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            modifier = modifier
+                .fillMaxSize()
+                .padding(24.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Text("노란불 코치 · Car API 차단 원인 실험", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-            DataRow("기어 / 브레이크", "${gearText.value}  /  ${brakeText.value}")
-            DataRow("조향각 / 방향지시등", "${steeringText.value}  /  ${turnSignalText.value}")
-            DataRow("Car 연결", carText.value)
-            DataRow("DO 인정 여부", doText.value)
-            DataRow("주행 제한 상태", uxText.value)
-            DataRow("차량 속도", speedText.value)
+            Text("노란불 코치 · 신호 데이터 연동 테스트", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text(
+                "기어 ${gearText.value}  ·  브레이크 ${brakeText.value}  ·  조향 ${steeringText.value}  ·  " +
+                        "깜빡이 ${turnSignalText.value}  ·  속도 ${speedText.value}  ·  주행 제한 ${uxText.value}",
+                fontSize = 15.sp
+            )
+            Button(onClick = { startCarSpeed() }) { Text("차량 속도 켜기 (P에서)") }
+
             Spacer(Modifier.height(4.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { connectCar() }) { Text("① Car 연결") }
-                Button(onClick = { startSpeed() }) { Text("② 속도 구독") }
-                Button(onClick = { stopSpeed() }) { Text("③ 구독 중지") }
-                Button(onClick = { disconnectCar() }) { Text("④ 연결 해제") }
+            Text(signalStatus.value, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+
+            // 표 머리
+            Row(Modifier.fillMaxWidth()) {
+                Text("교차로", fontSize = 15.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(220.dp))
+                Text("서→동 (wt 직진)", fontSize = 15.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(200.dp))
+                Text("동→서 (et 직진)", fontSize = 15.sp, fontWeight = FontWeight.Bold)
             }
+            corridor.forEach { (id, fallbackName) ->
+                val name = repo.intersections[id]?.name ?: fallbackName
+                val w = repo.current(id, Approach.W, Movement.STRAIGHT, now)
+                val e = repo.current(id, Approach.E, Movement.STRAIGHT, now)
+                Row(Modifier.fillMaxWidth()) {
+                    Text("$name ($id)", fontSize = 15.sp, modifier = Modifier.width(220.dp))
+                    Text(signalLabel(w), fontSize = 15.sp, color = phaseColor(w?.phase ?: Phase.UNKNOWN),
+                        fontWeight = FontWeight.SemiBold, modifier = Modifier.width(200.dp))
+                    Text(signalLabel(e), fontSize = 15.sp, color = phaseColor(e?.phase ?: Phase.UNKNOWN),
+                        fontWeight = FontWeight.SemiBold)
+                }
+            }
+
             Spacer(Modifier.height(4.dp))
-            Text("기록 (최신순)", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            logs.forEach { Text(it, fontSize = 15.sp) }
+            Text("기록 (최신순)", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            logs.forEach { Text(it, fontSize = 13.sp) }
         }
     }
 
-    @Composable
-    private fun DataRow(label: String, value: String) {
-        Row(modifier = Modifier.fillMaxWidth()) {
-            Text(label, fontSize = 18.sp, modifier = Modifier.width(220.dp))
-            Text(value, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        }
+    companion object {
+        private const val REFRESH_MS = 10_000L   // 정기 동기화 주기
+        private const val MIN_GAP_MS = 3_000L    // 신호 전환 시 재호출 최소 간격
     }
 }
