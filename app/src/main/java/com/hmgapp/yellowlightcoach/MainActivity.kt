@@ -66,6 +66,8 @@ import com.hmgapp.yellowlightcoach.signal.SignalRepository
 import com.hmgapp.yellowlightcoach.signal.SignalState
 import com.hmgapp.yellowlightcoach.ui.theme.YellowLightCoachTheme
 import com.hmgapp.yellowlightcoach.voice.VoiceGuide
+import com.hmgapp.yellowlightcoach.navi.NaviWatcher
+import com.hmgapp.yellowlightcoach.coach.TurnIntent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -126,6 +128,9 @@ class MainActivity : ComponentActivity() {
 
     // ---------- 음성 (Pleos TextToSpeech) ----------
     private lateinit var voice: VoiceGuide
+
+    // ---------- 순정 내비 (Pleos NaviHelper) ----------
+    private lateinit var navi: NaviWatcher
     private val beeper by lazy { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }
 
     private val logs = mutableStateListOf<String>()
@@ -201,6 +206,9 @@ class MainActivity : ComponentActivity() {
 
         voice = VoiceGuide(this) { msg -> log(msg) }
         voice.init()
+
+        navi = NaviWatcher(this) { msg -> log(msg) }
+        navi.init()
 
         startSignalLoop()
 
@@ -296,6 +304,8 @@ class MainActivity : ComponentActivity() {
     private fun startLocation() {
         val need = arrayOf(
             FUSED_LOCATION_PERMISSION,
+            "pleos.car.permission.NAVI_ROUTE",
+            "pleos.car.permission.NAVI_ROUTE_SEARCH",
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
         ).filter { !granted(it) }
@@ -382,6 +392,7 @@ class MainActivity : ComponentActivity() {
         car?.disconnect()
         tracker.stop()
         voice.release()
+        navi.release()
         beeper.release()
         super.onDestroy()
     }
@@ -459,12 +470,36 @@ class MainActivity : ComponentActivity() {
                 Button(onClick = { voice.stop() }) { Text("■ 멈춤") }
                 Button(onClick = { log("🔔 삐 요청"); beeper.startTone(ToneGenerator.TONE_PROP_BEEP, 200) }) { Text("🔔 삐 (비교용)") }
             }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                // 서→동으로 달리다 달동사거리에서 좌회전(북쪽)하게 되는 목적지
+                Button(onClick = { navi.requestRoute(LEFT_TEST_LAT, LEFT_TEST_LON, "좌회전 테스트") }) { Text("🧭 좌회전 경로 요청") }
+                Button(onClick = { navi.cancelRoute() }) { Text("🧭 경로 취소") }
+                Button(onClick = { navi.query() }) { Text("🧭 내비 위치 확인") }
+            }
+            val firstTbt = navi.tbtList.firstOrNull()
+            Text(
+                "내비: ${if (navi.connected) "연결" else "미연결"} · 상태 ${navi.status ?: "-"} · 모드 ${navi.naviMode ?: "-"} · " +
+                        "제한속도 ${navi.speedLimit?.let { "${it}km/h" } ?: "-"} · " +
+                        "TBT ${firstTbt?.let { "${it.type} %.0fm".format(it.distance) } ?: "-"} · " +
+                        "내비 위치 ${navi.naviLocation?.let { "%.5f, %.5f".format(it.latitude, it.longitude) } ?: "-"}",
+                fontSize = 15.sp
+            )
 
             // 앞 교차로
             Spacer(Modifier.height(4.dp))
             Text("현재 위치: ${locationText.value}", fontSize = 15.sp)
-            val intent = turnTracker.intent(now)
+            // 회전 의도: 깜빡이(3초 확인)가 우선, 없으면 내비 TBT(앞 교차로 거리와 맞을 때)
+            val signalIntent = turnTracker.intent(now)
+            val myFix = fix.value
+            val naviIntent = ahead.value?.let { a -> myFix?.let { f -> navi.turnAt(a.distanceM, f.lat, f.lon, now) } }
+            val intent = if (signalIntent != TurnIntent.NONE) signalIntent else naviIntent ?: TurnIntent.NONE
+            val intentSource = when {
+                signalIntent != TurnIntent.NONE -> "깜빡이"
+                naviIntent != null -> "내비 TBT"
+                else -> "-"
+            }
             val sit = SituationBuilder.build(ahead.value, intent, turning.value, repo, now)
+            Text("회전 판단: $intent (출처: $intentSource)", fontSize = 15.sp)
             if (turnTracker.rawIntent != intent) {
                 Text("깜빡이 ${turnTracker.rawIntent} 확인 중… (3초 넘게 켜져 있으면 회전으로 판단)", fontSize = 15.sp, color = Color.Gray)
             }
@@ -524,5 +559,8 @@ class MainActivity : ComponentActivity() {
         private const val RETRY_BASE_MS = 5_000L // 실패 시 첫 재시도 간격
         private const val RETRY_MAX_MS = 30_000L // 실패 시 최대 재시도 간격
         private const val FUSED_LOCATION_PERMISSION = "pleos.car.permission.FUSED_LOCATION"
+        // 좌회전 테스트 목적지: 달동사거리(35.534043, 129.314474)에서 북쪽으로 약 450m
+        private const val LEFT_TEST_LAT = 35.5381
+        private const val LEFT_TEST_LON = 129.3140
     }
 }
