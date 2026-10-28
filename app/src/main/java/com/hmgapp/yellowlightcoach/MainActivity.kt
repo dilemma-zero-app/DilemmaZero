@@ -179,9 +179,10 @@ class MainActivity : ComponentActivity() {
         }
     private val locationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-            val granted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true
-            log("위치 권한 ${if (granted) "허용" else "거부"}")
-            if (granted) startTracker()
+            val fused = result[FUSED_LOCATION_PERMISSION] == true
+            val gps = result[Manifest.permission.ACCESS_FINE_LOCATION] == true
+            log("위치 권한: Pleos ${if (fused) "허용" else "거부"} · GPS ${if (gps) "허용" else "거부"}")
+            if (fused || gps) startTracker()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -196,7 +197,7 @@ class MainActivity : ComponentActivity() {
         vehicle.getSteeringWheel().registerSteeringWheelAngle(steeringListener)
         vehicle.getTurnSignal().registerTurnSignalState(turnSignalListener)
 
-        tracker = LocationTracker(this) { f -> onFix(f) }
+        tracker = LocationTracker(this, log = { msg -> log(msg) }) { f -> ui { onFix(f) } }
 
         voice = VoiceGuide(this) { msg -> log(msg) }
         voice.init()
@@ -293,27 +294,30 @@ class MainActivity : ComponentActivity() {
     // ================= 위치 =================
 
     private fun startLocation() {
-        val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-        if (fine == PackageManager.PERMISSION_GRANTED) {
+        val need = arrayOf(
+            FUSED_LOCATION_PERMISSION,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ).filter { !granted(it) }
+        if (need.isEmpty()) {
             startTracker()
         } else {
             // 권한 창은 주차(P) 상태에서만 (주행 중엔 차단됨)
-            locationPermissionLauncher.launch(
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
-            )
+            locationPermissionLauncher.launch(need.toTypedArray())
         }
     }
 
     private fun startTracker() {
-        val ok = tracker.start()
-        locationText.value = if (ok) "위치 기다리는 중…" else "❌ GPS가 꺼져 있어요"
+        val ok = tracker.start(useFused = granted(FUSED_LOCATION_PERMISSION))
+        locationText.value = if (ok) "위치 기다리는 중… (${tracker.source})" else "❌ 위치를 받을 수 없어요"
         log(if (ok) "위치 받기 시작" else "GPS 꺼짐")
     }
 
     private fun onFix(f: Fix) {
         fix.value = f
         val head = f.headingDeg?.let { "%s %.0f°".format(Geo.compass(it), it) } ?: "모름(움직이면 계산)"
-        locationText.value = "%.6f, %.6f · 진행 방향 %s".format(f.lat, f.lon, head)
+        val sdk = f.sdkHeadingDeg?.let { " · SDK 방향 %.0f° (신뢰도 %.2f)".format(it, f.confidence ?: 0f) } ?: ""
+        locationText.value = "[${f.source}] %.6f, %.6f · 계산 방향 %s%s".format(f.lat, f.lon, head, sdk)
         val newAhead = AheadFinder.find(
             f, repo.intersections.values, { id -> repo.approachesWithSignal(id) }, ahead.value
         )
@@ -385,6 +389,9 @@ class MainActivity : ComponentActivity() {
     // ================= 도우미 =================
 
     private fun ui(block: () -> Unit) = runOnUiThread(block)
+
+    private fun granted(permission: String) =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
     private fun log(msg: String) {
         Log.d(tag, msg)
@@ -516,5 +523,6 @@ class MainActivity : ComponentActivity() {
         private const val MIN_GAP_MS = 3_000L    // 신호 전환 시 재호출 최소 간격
         private const val RETRY_BASE_MS = 5_000L // 실패 시 첫 재시도 간격
         private const val RETRY_MAX_MS = 30_000L // 실패 시 최대 재시도 간격
+        private const val FUSED_LOCATION_PERMISSION = "pleos.car.permission.FUSED_LOCATION"
     }
 }
