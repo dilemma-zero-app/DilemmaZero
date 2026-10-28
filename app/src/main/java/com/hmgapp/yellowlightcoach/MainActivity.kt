@@ -15,6 +15,8 @@ import android.car.drivingstate.CarUxRestrictionsManager
 import android.car.hardware.CarPropertyValue
 import android.car.hardware.property.CarPropertyManager
 import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -63,6 +65,7 @@ import com.hmgapp.yellowlightcoach.signal.SignalApi
 import com.hmgapp.yellowlightcoach.signal.SignalRepository
 import com.hmgapp.yellowlightcoach.signal.SignalState
 import com.hmgapp.yellowlightcoach.ui.theme.YellowLightCoachTheme
+import com.hmgapp.yellowlightcoach.voice.VoiceGuide
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -120,6 +123,10 @@ class MainActivity : ComponentActivity() {
     private val fix = mutableStateOf<Fix?>(null)
     private val ahead = mutableStateOf<Ahead?>(null)
     private val locationText = mutableStateOf("꺼짐")
+
+    // ---------- 음성 (Pleos TextToSpeech) ----------
+    private lateinit var voice: VoiceGuide
+    private val beeper by lazy { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }
 
     private val logs = mutableStateListOf<String>()
 
@@ -190,6 +197,9 @@ class MainActivity : ComponentActivity() {
         vehicle.getTurnSignal().registerTurnSignalState(turnSignalListener)
 
         tracker = LocationTracker(this) { f -> onFix(f) }
+
+        voice = VoiceGuide(this) { msg -> log(msg) }
+        voice.init()
 
         startSignalLoop()
 
@@ -367,6 +377,8 @@ class MainActivity : ComponentActivity() {
         uxManager?.unregisterListener()
         car?.disconnect()
         tracker.stop()
+        voice.release()
+        beeper.release()
         super.onDestroy()
     }
 
@@ -379,7 +391,7 @@ class MainActivity : ComponentActivity() {
         val time = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date())
         ui {
             logs.add(0, "$time  $msg")
-            if (logs.size > 6) logs.removeAt(logs.lastIndex)
+            if (logs.size > 12) logs.removeAt(logs.lastIndex)
         }
     }
 
@@ -433,6 +445,12 @@ class MainActivity : ComponentActivity() {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = { startCarSpeed() }) { Text("차량 속도 켜기 (P에서)") }
                 Button(onClick = { startLocation() }) { Text("위치 켜기 (P에서)") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(onClick = { voice.speak("앞 신호, 속도 줄이세요") }) { Text("🔊 속도 줄이세요") }
+                Button(onClick = { voice.speak("정지 준비") }) { Text("🔊 정지 준비") }
+                Button(onClick = { voice.stop() }) { Text("■ 멈춤") }
+                Button(onClick = { log("🔔 삐 요청"); beeper.startTone(ToneGenerator.TONE_PROP_BEEP, 200) }) { Text("🔔 삐 (비교용)") }
             }
 
             // 앞 교차로
