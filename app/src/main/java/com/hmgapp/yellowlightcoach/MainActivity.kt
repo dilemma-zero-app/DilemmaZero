@@ -19,6 +19,9 @@ import android.media.AudioManager
 import android.media.ToneGenerator
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -60,7 +63,6 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.repeatOnLifecycle
 import com.hmgapp.yellowlightcoach.coach.SituationBuilder
 import com.hmgapp.yellowlightcoach.coach.TurnIntentTracker
 import com.hmgapp.yellowlightcoach.coach.TurningDetector
@@ -78,6 +80,7 @@ import com.hmgapp.yellowlightcoach.signal.SignalState
 import com.hmgapp.yellowlightcoach.ui.theme.YellowLightCoachTheme
 import com.hmgapp.yellowlightcoach.voice.VoiceGuide
 import com.hmgapp.yellowlightcoach.navi.NaviWatcher
+import com.hmgapp.yellowlightcoach.service.CoachService
 import com.hmgapp.yellowlightcoach.coach.TurnIntent
 import com.hmgapp.yellowlightcoach.coach.AlertPolicy
 import com.hmgapp.yellowlightcoach.coach.DilemmaEvaluator
@@ -299,15 +302,16 @@ class MainActivity : ComponentActivity() {
         log("🧪 5초 뒤 팝업 — 지금 내비 화면으로 가세요")
         lifecycleScope.launch {
             delay(5_000)
-            showAlert("정지 준비", "앞 신호 · 팝업 테스트")
+            showAlert(Level.PREPARE_STOP, "정지 준비", "앞 신호 · 팝업 테스트")
             voice.speak("정지 준비")
         }
     }
 
     @android.annotation.SuppressLint("MissingPermission")
-    private fun showAlert(title: String, text: String) {
+    private fun showAlert(level: Level, title: String, text: String) {
         val n = NotificationCompat.Builder(this, ALERT_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setLargeIcon(dot(if (level == Level.CAUTION) 0xFFF5B700.toInt() else 0xFFD93B30.toInt()))
             .setContentTitle(title)
             .setContentText(text)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
@@ -316,13 +320,21 @@ class MainActivity : ComponentActivity() {
             .setAutoCancel(true)
             .build()
         NotificationManagerCompat.from(this).notify(ALERT_ID, n)
-        log("🧪 팝업 보냄: $title")
+        log("📣 팝업: $title")
+    }
+
+    /** 팝업 왼쪽 색 동그라미 (노랑=주의, 빨강=정지 준비) */
+    private fun dot(color: Int): Bitmap {
+        val b = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+        Canvas(b).drawCircle(48f, 48f, 44f, Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color })
+        return b
     }
 
     // ================= 자동 시작 =================
 
-    private val sensorPermissions get() = arrayOf(
+    private val sensorPermissions get() = listOfNotNull(
         Car.PERMISSION_SPEED,
+        if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else null,
         FUSED_LOCATION_PERMISSION,
         "pleos.car.permission.NAVI_ROUTE",
         "pleos.car.permission.NAVI_ROUTE_SEARCH",
@@ -358,8 +370,9 @@ class MainActivity : ComponentActivity() {
             return
         }
         lifecycleScope.launch {
-            // 화면이 보일 때만 동작 (안 보이면 멈춰서 호출 한도 아끼기)
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
+            // 방법 A: 순정 내비를 보는 동안(우리 앱이 화면 뒤에 있어도) 계속 동작
+            // → CoachService(포그라운드 서비스)가 앱을 살려 둔다
+            run {
                 if (repo.intersections.isEmpty()) {
                     try {
                         repo.loadIntersections()
@@ -451,6 +464,8 @@ class MainActivity : ComponentActivity() {
         if (trackerRunning) return
         val ok = tracker.start(useFused = granted(FUSED_LOCATION_PERMISSION))
         trackerRunning = ok
+        // 위치 권한이 있을 때만 위치 유형 포그라운드 서비스를 시작할 수 있다
+        if (ok) try { CoachService.start(this) } catch (e: Exception) { log("서비스 시작 실패: ${e.message}") }
         locationText.value = if (ok) "위치 기다리는 중… (${tracker.source})" else "❌ 위치를 받을 수 없어요"
         log(if (ok) "위치 받기 시작" else "GPS 꺼짐")
     }
@@ -512,6 +527,12 @@ class MainActivity : ComponentActivity() {
         log("🗣 ${v.level.label}: \"$text\" (${sit.ahead?.intersection?.name}, " +
                 "%.0fkm/h, 정지선 %.0fm, 녹색 %.1f초)".format(speedMps * 3.6, sit.stopLineM ?: 0.0, v.greenSec))
         voice.speak(text)
+        // 우리 앱이 화면 뒤에 있을 때(순정 내비를 보는 중)만 팝업 — 앱이 보이면 큰 배너가 이미 있음
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            val name = sit.ahead?.intersection?.name
+            showAlert(v.level, if (v.level == Level.CAUTION) "속도 줄이세요" else "정지 준비",
+                name?.let { "앞 신호 · $it" } ?: "앞 신호")
+        }
     }
 
     private fun levelColor(l: Level) = when (l) {
@@ -569,6 +590,7 @@ class MainActivity : ComponentActivity() {
         uxManager?.unregisterListener()
         car?.disconnect()
         tracker.stop()
+        CoachService.stop(this)
         voice.release()
         navi.release()
         beeper.release()
