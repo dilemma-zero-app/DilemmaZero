@@ -63,6 +63,39 @@ class SignalRepository(
         receivedAtWall = nowWall
     }
 
+    // ---------- 재생 모드 (4단계) ----------
+    private var liveIntersections: Map<String, Intersection>? = null
+
+    /** 재생 시작: 실시간 교차로·신호를 비우고 기록 값만 쓰게 */
+    fun beginReplay() {
+        if (liveIntersections == null) liveIntersections = intersections
+        intersections = emptyMap()
+        snapshot = emptyMap()
+        baseElapsedById = emptyMap()
+        receivedAtElapsed = 0L
+    }
+
+    fun replayIntersection(ix: Intersection) {
+        intersections = intersections + (ix.id to ix)
+    }
+
+    /** 기록된 신호를 그대로 넣기. bases = 교차로별 카운트다운 기준 시각 (부팅 후 경과 ms) */
+    fun replaySignals(list: List<IntersectionSignals>, bases: Map<String, Long>, recordedWall: Long) {
+        baseElapsedById = bases
+        snapshot = list.associateBy { it.id }
+        receivedAtElapsed = SystemClock.elapsedRealtime()
+        receivedAtWall = recordedWall
+    }
+
+    /** 재생 끝: 실시간 교차로로 되돌리고, 신호는 다음 호출에서 새로 받기 */
+    fun endReplay() {
+        liveIntersections?.let { intersections = it }
+        liveIntersections = null
+        snapshot = emptyMap()
+        baseElapsedById = emptyMap()
+        receivedAtElapsed = 0L
+    }
+
     /** 이 교차로의 카운트다운 기준 시각 (기록용) */
     fun baseElapsed(id: String): Long = baseElapsedById[id] ?: receivedAtElapsed
 

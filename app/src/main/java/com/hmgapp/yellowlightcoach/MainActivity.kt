@@ -87,6 +87,9 @@ import com.hmgapp.yellowlightcoach.voice.VoiceGuide
 import com.hmgapp.yellowlightcoach.navi.NaviWatcher
 import com.hmgapp.yellowlightcoach.service.CoachService
 import com.hmgapp.yellowlightcoach.demo.DemoRecorder
+import com.hmgapp.yellowlightcoach.demo.DemoReplay
+import com.hmgapp.yellowlightcoach.signal.Intersection
+import com.hmgapp.yellowlightcoach.signal.IntersectionSignals
 import com.hmgapp.yellowlightcoach.coach.TurnIntent
 import com.hmgapp.yellowlightcoach.coach.AlertPolicy
 import com.hmgapp.yellowlightcoach.coach.DilemmaEvaluator
@@ -159,8 +162,13 @@ class MainActivity : ComponentActivity() {
     // ---------- 순정 내비 (Pleos NaviHelper) ----------
     private lateinit var navi: NaviWatcher
 
-    // ---------- 4단계: 주행 기록 ----------
+    // ---------- 4단계: 주행 기록 · 재생 ----------
     private lateinit var recorder: DemoRecorder
+    private lateinit var replay: DemoReplay
+    /** 재생 중에도 실제 차량 값은 따로 기억해 두었다가, 재생이 끝나면 되돌린다 */
+    private var liveDrive = false
+    private var liveGearLabel = "-"
+    private var liveSpeedMps = 0.0
 
     // ---------- 판정 (3b단계) ----------
     @Volatile private var speedMps = 0.0
@@ -169,7 +177,7 @@ class MainActivity : ComponentActivity() {
     private var autoAsked = false
     private var trackerRunning = false
     private val fatigue = FatigueTracker()
-    private val policy = AlertPolicy()
+    private var policy = AlertPolicy()
     private val profile = DriverProfile()          // 기본 모드 (반응 1.0초, 감속 3.0m/s²)
     private val sitState = mutableStateOf<Situation?>(null)
     private val verdict = mutableStateOf<Verdict?>(null)
@@ -181,20 +189,51 @@ class MainActivity : ComponentActivity() {
     // ---------- Vehicle SDK 리스너 ----------
     private val gearListener = object : GearSelectionListener {
         override fun onSelected(gear: VehicleGear?) = ui {
-            gearText.value = gearLabel(gear)
-            val now = SystemClock.elapsedRealtime()
-            isDrive = gear == VehicleGear.GEAR_DRIVE
-            fatigue.onGear(isDrive, now)
-            recorder.gear(isDrive)
+            liveDrive = gear == VehicleGear.GEAR_DRIVE
+            liveGearLabel = gearLabel(gear)
             // 주행 중이라 권한 창이 막혔었다면, P가 되는 순간 다시 자동 시작
-            if (!isDrive && !autoAsked && !(speedSubscribed && trackerRunning)) autoStart()
-            // 2시간 넘게 달린 뒤 P에서 한 번만 휴식 권유
-            if (!isDrive && fatigue.shouldRemindRest(now)) {
-                voice.speak("2시간째 운전 중이에요. 쉬었다 가세요")
-            }
+            if (!liveDrive && !autoAsked && !(speedSubscribed && trackerRunning)) autoStart()
+            if (replay.active) return@ui      // 재생 중엔 기록된 기어를 씀
+            applyGear(liveDrive, liveGearLabel)
         }
         override fun onFailed(e: Exception) = log("기어 오류: ${e.message}")
     }
+    /** 기어 반영 (실시간·재생 공통) */
+    private fun applyGear(drive: Boolean, label: String) {
+        gearText.value = label
+        val now = SystemClock.elapsedRealtime()
+        isDrive = drive
+        fatigue.onGear(isDrive, now)
+        recorder.gear(isDrive)
+        // 2시간 넘게 달린 뒤 P에서 한 번만 휴식 권유
+        if (!isDrive && fatigue.shouldRemindRest(now)) {
+            voice.speak("2시간째 운전 중이에요. 쉬었다 가세요")
+        }
+    }
+
+    /** 조향각 반영 (실시간·재생 공통) */
+    private fun applySteering(angle: Float) {
+        steeringText.value = "%.1f°".format(angle)
+        recorder.steering(angle)
+        val t = turningDetector.update(angle)
+        if (t != turning.value) log(if (t) "회전 시작 → 안내 멈춤" else "회전 끝 → 안내 재개")
+        turning.value = t
+    }
+
+    /** 깜빡이 반영 (실시간·재생 공통) */
+    private fun applyTurnSignal(name: String?) {
+        turnSignalText.value = name ?: "-"
+        turnTracker.update(name, SystemClock.elapsedRealtime())
+        recorder.turnSignal(name)
+    }
+
+    /** 속도 반영 (실시간·재생 공통) */
+    private fun applySpeed(mps: Double) {
+        speedMps = mps
+        recorder.speed(mps)
+        ui { speedText.value = "%.1f km/h".format(mps * 3.6) }
+    }
+
     private val brakeListener = object : BrakePedalStatusListener {
         override fun onBrakePedalStatusUpdated(status: Boolean?) =
             ui { brakeText.value = if (status == true) "🟥 밟음" else "⬜ 뗌" }
@@ -203,22 +242,16 @@ class MainActivity : ComponentActivity() {
     private val steeringListener = object : SteeringWheelAngleListener {
         override fun onSteeringWheelAngleUpdated(angle: Float?) =
             ui {
-                steeringText.value = angle?.let { "%.1f°".format(it) } ?: "-"
-                if (angle != null) {
-                    recorder.steering(angle)
-                    val t = turningDetector.update(angle)
-                    if (t != turning.value) log(if (t) "회전 시작 → 안내 멈춤" else "회전 끝 → 안내 재개")
-                    turning.value = t
-                }
+                if (replay.active) return@ui
+                if (angle == null) steeringText.value = "-" else applySteering(angle)
             }
         override fun onFailed(e: Exception) = log("조향각 오류: ${e.message}")
     }
     private val turnSignalListener = object : TurnSignalStateListener {
         override fun onTurnSignalStateUpdated(state: TurnSignalValue?) =
             ui {
-                turnSignalText.value = state?.name ?: "-"
-                turnTracker.update(state?.name, SystemClock.elapsedRealtime())
-                recorder.turnSignal(state?.name)
+                if (replay.active) return@ui
+                applyTurnSignal(state?.name)
             }
         override fun onFailed(e: Exception) = log("방향지시등 오류: ${e.message}")
     }
@@ -227,9 +260,9 @@ class MainActivity : ComponentActivity() {
     private val speedCallback = object : CarPropertyManager.CarPropertyEventCallback {
         override fun onChangeEvent(value: CarPropertyValue<*>) {
             val mps = value.value as? Float ?: return
-            speedMps = mps.toDouble()
-            recorder.speed(speedMps)
-            ui { speedText.value = "%.1f km/h".format(mps * 3.6f) }
+            liveSpeedMps = mps.toDouble()
+            if (replay.active) return       // 재생 중엔 기록된 속도를 씀
+            applySpeed(liveSpeedMps)
         }
         override fun onErrorEvent(propId: Int, zone: Int) = log("속도 오류 propId=$propId")
     }
@@ -268,6 +301,7 @@ class MainActivity : ComponentActivity() {
         log("앱 시작")
         // 차량 리스너보다 먼저 만들어야 함 (리스너가 등록 즉시 불릴 수 있음)
         recorder = DemoRecorder(this) { msg -> log(msg) }
+        replay = DemoReplay(this) { msg -> log(msg) }
 
         vehicle = Vehicle(this)
         vehicle.initialize()
@@ -276,7 +310,7 @@ class MainActivity : ComponentActivity() {
         vehicle.getSteeringWheel().registerSteeringWheelAngle(steeringListener)
         vehicle.getTurnSignal().registerTurnSignalState(turnSignalListener)
 
-        tracker = LocationTracker(this, log = { msg -> log(msg) }) { f -> ui { onFix(f) } }
+        tracker = LocationTracker(this, log = { msg -> log(msg) }) { f -> ui { if (!replay.active) onFix(f) } }
 
         voice = VoiceGuide(this) { msg -> log(msg) }
         voice.init()
@@ -326,6 +360,50 @@ class MainActivity : ComponentActivity() {
         if (!recorder.recording) return recorder.file?.let { "마지막 기록: ${it.name}" } ?: "기록 없음"
         val sec = recorder.elapsedMs(now) / 1000
         return "● 기록 중 %d:%02d · %d줄 · %s".format(sec / 60, sec % 60, recorder.lineCount, recorder.file?.name ?: "")
+    }
+
+    // ================= 4단계: 재생 =================
+
+    private val replaySink = object : DemoReplay.Sink {
+        override fun onIntersection(ix: Intersection) = repo.replayIntersection(ix)
+        override fun onSignals(list: List<IntersectionSignals>, baseOffsetMs: Map<String, Long>, recordedWall: Long) {
+            repo.replaySignals(list, baseOffsetMs.mapValues { replay.startElapsed + it.value }, recordedWall)
+            updateStatus()
+        }
+        override fun onFix(f: Fix) = this@MainActivity.onFix(f)
+        override fun onSpeed(mps: Double) = applySpeed(mps)
+        override fun onGear(isDrive: Boolean) = applyGear(isDrive, if (isDrive) "D" else "P")
+        override fun onTurn(state: String?) = applyTurnSignal(state)
+        override fun onSteer(deg: Float) = applySteering(deg)
+        override fun onEnd() {
+            // 실시간으로 되돌리기: 교차로·신호는 다음 호출에서 새로, 기어·속도는 실제 값으로
+            repo.endReplay()
+            ahead.value = null
+            policy = AlertPolicy()
+            applyGear(liveDrive, liveGearLabel)
+            applySpeed(liveSpeedMps)
+            signalStatus.value = "실시간으로 돌아가는 중…"
+        }
+    }
+
+    private fun toggleReplay() {
+        if (replay.active) {
+            replay.stop(replaySink)
+            return
+        }
+        if (recorder.recording) recorder.stop()
+        // 새 장면: 앞 교차로·안내 기록을 비우고 시작
+        repo.beginReplay()
+        ahead.value = null
+        policy = AlertPolicy()
+        if (!replay.start(lifecycleScope, replaySink)) repo.endReplay()
+    }
+
+    private fun replayLabel(now: Long): String {
+        if (!replay.active) return replay.latestRecording()?.let { "재생할 기록: ${it.name}" } ?: "재생할 기록 없음 (assets/demo.jsonl 사용)"
+        val e = replay.elapsedMs(now) / 1000
+        val d = replay.durationMs / 1000
+        return "▶ 시연용 재생 데이터 %d:%02d / %d:%02d · %s".format(e / 60, e % 60, d / 60, d % 60, replay.sourceName)
     }
 
     // ================= 팝업 테스트 (10/29) =================
@@ -481,7 +559,9 @@ class MainActivity : ComponentActivity() {
                 var failCount = 0
                 while (isActive) {
                     val now = SystemClock.elapsedRealtime()
-                    if (now >= nextRefresh) {
+                    if (replay.active) {
+                        // 재생 중: 신호 API를 부르지 않고 기록된 신호만 사용
+                    } else if (now >= nextRefresh) {
                         // 성공·실패와 상관없이 "시도한 시각"을 기록 → 실패해도 연달아 부르지 않음
                         lastRefresh = now
                         val ok = try {
@@ -692,6 +772,7 @@ class MainActivity : ComponentActivity() {
         car?.disconnect()
         tracker.stop()
         recorder.release()
+        if (replay.active) replay.stop(replaySink)
         CoachService.stop(this)
         voice.release()
         navi.release()
@@ -793,6 +874,10 @@ class MainActivity : ComponentActivity() {
                     Text("● 기록 중", fontSize = 16.sp, color = Color(0xFFFF6B5E), fontWeight = FontWeight.Bold)
                     Spacer(Modifier.width(12.dp))
                 }
+                if (replay.active) {
+                    Text("▶ 시연용 재생 데이터", fontSize = 16.sp, color = Color(0xFFF5B700), fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(12.dp))
+                }
                 OutlinedButton(onClick = { devView.value = true }) { Text("개발자 보기", color = Color(0xFF9AA3AD)) }
             }
 
@@ -875,6 +960,13 @@ class MainActivity : ComponentActivity() {
                 }
                 Text(recordingLabel(now), fontSize = 15.sp,
                     color = if (recorder.recording) Color(0xFFC8392F) else Color.Gray)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = { toggleReplay() }) {
+                    Text(if (replay.active) "■ 재생 멈춤" else "▶ 기록 재생")
+                }
+                Text(replayLabel(now), fontSize = 15.sp,
+                    color = if (replay.active) Color(0xFFB07800) else Color.Gray)
             }
             val firstTbt = navi.tbtList.firstOrNull()
             Text(

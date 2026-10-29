@@ -20,7 +20,7 @@ import java.util.concurrent.Executors
  * 주행 중 "판정에 들어가는 모든 입력"을 시간 순서대로 파일에 남긴다.
  * 나중에 재생 모드가 이 파일을 그대로 다시 넣으면, 몇 번을 틀어도 같은 장면이 나온다.
  *
- * 파일: 앱 전용 폴더 /recordings/rec_날짜_시각.jsonl (한 줄 = 사건 하나, JSON)
+ * 파일: 앱 내부 폴더 files/recordings/rec_날짜_시각.jsonl (한 줄 = 사건 하나, JSON)
  *   t    = 기록 시작부터 지난 시간(ms)
  *   type = start · ix(교차로 위치) · sig(신호) · fix(위치) · spd(속도) · gear · turn(깜빡이) · steer(조향) · end
  *
@@ -29,7 +29,9 @@ import java.util.concurrent.Executors
  */
 class DemoRecorder(context: Context, private val log: (String) -> Unit) {
 
-    private val dir = File(context.getExternalFilesDir(null), "recordings").apply { mkdirs() }
+    // 앱 내부 폴더 (/data/user/10/<패키지>/files/recordings)
+    // 외부 폴더는 출시용 에뮬레이터에서 adb로 꺼낼 수 없어서(Permission denied) 내부 폴더 + run-as로 꺼낸다
+    private val dir = File(context.filesDir, "recordings").apply { mkdirs() }
     private val io = Executors.newSingleThreadExecutor()   // 파일 쓰기는 화면 스레드 밖에서
 
     @Volatile var recording = false
