@@ -86,6 +86,7 @@ import com.hmgapp.yellowlightcoach.ui.theme.YellowLightCoachTheme
 import com.hmgapp.yellowlightcoach.voice.VoiceGuide
 import com.hmgapp.yellowlightcoach.navi.NaviWatcher
 import com.hmgapp.yellowlightcoach.service.CoachService
+import com.hmgapp.yellowlightcoach.demo.DemoRecorder
 import com.hmgapp.yellowlightcoach.coach.TurnIntent
 import com.hmgapp.yellowlightcoach.coach.AlertPolicy
 import com.hmgapp.yellowlightcoach.coach.DilemmaEvaluator
@@ -158,6 +159,9 @@ class MainActivity : ComponentActivity() {
     // ---------- 순정 내비 (Pleos NaviHelper) ----------
     private lateinit var navi: NaviWatcher
 
+    // ---------- 4단계: 주행 기록 ----------
+    private lateinit var recorder: DemoRecorder
+
     // ---------- 판정 (3b단계) ----------
     @Volatile private var speedMps = 0.0
     @Volatile private var isDrive = false
@@ -181,6 +185,7 @@ class MainActivity : ComponentActivity() {
             val now = SystemClock.elapsedRealtime()
             isDrive = gear == VehicleGear.GEAR_DRIVE
             fatigue.onGear(isDrive, now)
+            recorder.gear(isDrive)
             // 주행 중이라 권한 창이 막혔었다면, P가 되는 순간 다시 자동 시작
             if (!isDrive && !autoAsked && !(speedSubscribed && trackerRunning)) autoStart()
             // 2시간 넘게 달린 뒤 P에서 한 번만 휴식 권유
@@ -200,6 +205,7 @@ class MainActivity : ComponentActivity() {
             ui {
                 steeringText.value = angle?.let { "%.1f°".format(it) } ?: "-"
                 if (angle != null) {
+                    recorder.steering(angle)
                     val t = turningDetector.update(angle)
                     if (t != turning.value) log(if (t) "회전 시작 → 안내 멈춤" else "회전 끝 → 안내 재개")
                     turning.value = t
@@ -212,6 +218,7 @@ class MainActivity : ComponentActivity() {
             ui {
                 turnSignalText.value = state?.name ?: "-"
                 turnTracker.update(state?.name, SystemClock.elapsedRealtime())
+                recorder.turnSignal(state?.name)
             }
         override fun onFailed(e: Exception) = log("방향지시등 오류: ${e.message}")
     }
@@ -221,6 +228,7 @@ class MainActivity : ComponentActivity() {
         override fun onChangeEvent(value: CarPropertyValue<*>) {
             val mps = value.value as? Float ?: return
             speedMps = mps.toDouble()
+            recorder.speed(speedMps)
             ui { speedText.value = "%.1f km/h".format(mps * 3.6f) }
         }
         override fun onErrorEvent(propId: Int, zone: Int) = log("속도 오류 propId=$propId")
@@ -258,6 +266,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         log("앱 시작")
+        // 차량 리스너보다 먼저 만들어야 함 (리스너가 등록 즉시 불릴 수 있음)
+        recorder = DemoRecorder(this) { msg -> log(msg) }
 
         vehicle = Vehicle(this)
         vehicle.initialize()
@@ -294,6 +304,28 @@ class MainActivity : ComponentActivity() {
                 setSound(null, null)   // 소리는 우리 음성 안내로만
             }
         )
+    }
+
+    // ================= 4단계: 주행 기록 =================
+
+    private fun toggleRecording() {
+        if (recorder.recording) {
+            recorder.stop()
+            return
+        }
+        recorder.start()
+        // 시작 순간의 상태를 바로 남겨 둔다 (재생 첫 장면이 비지 않게)
+        recorder.gear(isDrive)
+        recorder.speed(speedMps)
+        fix.value?.let { recorder.fix(it) }
+        recorder.signals(repo, fix.value?.lat, fix.value?.lon)
+        if (fix.value == null) log("⚠ 아직 위치가 없어요 — 위치가 들어오면 다음 신호부터 기록돼요")
+    }
+
+    private fun recordingLabel(now: Long): String {
+        if (!recorder.recording) return recorder.file?.let { "마지막 기록: ${it.name}" } ?: "기록 없음"
+        val sec = recorder.elapsedMs(now) / 1000
+        return "● 기록 중 %d:%02d · %d줄 · %s".format(sec / 60, sec % 60, recorder.lineCount, recorder.file?.name ?: "")
     }
 
     // ================= 팝업 테스트 (10/29) =================
@@ -454,6 +486,7 @@ class MainActivity : ComponentActivity() {
                         lastRefresh = now
                         val ok = try {
                             repo.refreshSignals()
+                            recorder.signals(repo, fix.value?.lat, fix.value?.lon)
                             updateStatus()
                             failCount = 0
                             true
@@ -534,6 +567,7 @@ class MainActivity : ComponentActivity() {
 
     private fun onFix(f: Fix) {
         fix.value = f
+        recorder.fix(f)
         val head = f.headingDeg?.let { "%s %.0f°".format(Geo.compass(it), it) } ?: "모름(움직이면 계산)"
         val sdk = f.sdkHeadingDeg?.let { " · SDK 방향 %.0f° (신뢰도 %.2f)".format(it, f.confidence ?: 0f) } ?: ""
         locationText.value = "[${f.source}] %.6f, %.6f · 계산 방향 %s%s".format(f.lat, f.lon, head, sdk)
@@ -657,6 +691,7 @@ class MainActivity : ComponentActivity() {
         uxManager?.unregisterListener()
         car?.disconnect()
         tracker.stop()
+        recorder.release()
         CoachService.stop(this)
         voice.release()
         navi.release()
@@ -754,6 +789,10 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.width(16.dp))
                 Text("기어 ${gearText.value} · ${speedText.value}", fontSize = 16.sp, color = Color(0xFF9AA3AD),
                     modifier = Modifier.weight(1f))
+                if (recorder.recording) {
+                    Text("● 기록 중", fontSize = 16.sp, color = Color(0xFFFF6B5E), fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(12.dp))
+                }
                 OutlinedButton(onClick = { devView.value = true }) { Text("개발자 보기", color = Color(0xFF9AA3AD)) }
             }
 
@@ -829,6 +868,13 @@ class MainActivity : ComponentActivity() {
                 Button(onClick = { navi.requestRoute(LEFT_TEST_LAT, LEFT_TEST_LON, "좌회전 테스트") }) { Text("🧭 좌회전 경로 요청") }
                 Button(onClick = { navi.cancelRoute() }) { Text("🧭 경로 취소") }
                 Button(onClick = { navi.query() }) { Text("🧭 내비 위치 확인") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = { toggleRecording() }) {
+                    Text(if (recorder.recording) "⏹ 기록 끝" else "⏺ 주행 기록 시작")
+                }
+                Text(recordingLabel(now), fontSize = 15.sp,
+                    color = if (recorder.recording) Color(0xFFC8392F) else Color.Gray)
             }
             val firstTbt = navi.tbtList.firstOrNull()
             Text(

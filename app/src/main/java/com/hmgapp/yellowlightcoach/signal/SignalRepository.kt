@@ -63,6 +63,9 @@ class SignalRepository(
         receivedAtWall = nowWall
     }
 
+    /** 이 교차로의 카운트다운 기준 시각 (기록용) */
+    fun baseElapsed(id: String): Long = baseElapsedById[id] ?: receivedAtElapsed
+
     /** 이 교차로·진입 방향에 이 종류(직진/좌회전) 신호가 있는지 */
     fun hasSignal(id: String, approach: Approach, movement: Movement): Boolean =
         snapshot[id]?.signals?.containsKey(approach to movement) == true
