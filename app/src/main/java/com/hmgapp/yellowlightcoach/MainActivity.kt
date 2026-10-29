@@ -22,7 +22,12 @@ import android.app.NotificationManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.provider.Settings
+import android.view.View
+import android.view.WindowManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -323,6 +328,63 @@ class MainActivity : ComponentActivity() {
         log("📣 팝업: $title")
     }
 
+    // ================= 테두리 테스트 (10/29) =================
+    // 질문: 순정 내비를 보고 있을 때, 화면 가장자리를 색으로 물들일 수 있나? (다른 앱 위에 그리기)
+
+    private fun testEdgeGlow() {
+        if (!Settings.canDrawOverlays(this)) {
+            log("🧪 '다른 앱 위에 그리기' 권한 없음 → PowerShell에서 appops 명령 실행 후 다시")
+            return
+        }
+        log("🧪 5초 뒤 테두리 — 지금 내비 화면으로 가세요")
+        lifecycleScope.launch {
+            delay(5_000)
+            showEdgeGlow(Level.PREPARE_STOP)
+            voice.speak("정지 준비")
+        }
+    }
+
+    /** 화면 가장자리에 색 테두리를 3초 동안 (가운데는 투명 → 내비 그대로 보임, 터치도 통과) */
+    private var glowView: View? = null
+
+    private fun showEdgeGlow(level: Level) {
+        val wm = getSystemService(WindowManager::class.java)
+        // 주의 → 정지 준비로 바로 올라가면 이전 테두리를 지우고 새 색으로
+        glowView?.let { old -> try { wm.removeView(old) } catch (_: Exception) {} }
+        glowView = null
+        val color = if (level == Level.CAUTION) 0xFFF5B700.toInt() else 0xFFD93B30.toInt()
+        val view = View(this).apply {
+            background = GradientDrawable().apply {
+                setColor(0x00000000)                 // 가운데 투명
+                setStroke(36, color)                 // 가장자리 두께(px)
+                cornerRadius = 24f
+            }
+            alpha = 0.85f
+        }
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        try {
+            wm.addView(view, lp)
+            glowView = view
+            log("🟥 테두리: ${level.label}")
+            lifecycleScope.launch {
+                delay(3_000)
+                if (glowView === view) {
+                    try { wm.removeView(view) } catch (_: Exception) {}
+                    glowView = null
+                }
+            }
+        } catch (e: Exception) {
+            log("❌ 테두리 실패: ${e.message}")
+        }
+    }
+
     /** 팝업 왼쪽 색 동그라미 (노랑=주의, 빨강=정지 준비) */
     private fun dot(color: Int): Bitmap {
         val b = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
@@ -528,10 +590,15 @@ class MainActivity : ComponentActivity() {
                 "%.0fkm/h, 정지선 %.0fm, 녹색 %.1f초)".format(speedMps * 3.6, sit.stopLineM ?: 0.0, v.greenSec))
         voice.speak(text)
         // 우리 앱이 화면 뒤에 있을 때(순정 내비를 보는 중)만 팝업 — 앱이 보이면 큰 배너가 이미 있음
+        // 표시 방식: '다른 앱 위에 그리기'가 허용되면 화면 테두리 색, 아니면 팝업 (10/29)
         if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-            val name = sit.ahead?.intersection?.name
-            showAlert(v.level, if (v.level == Level.CAUTION) "속도 줄이세요" else "정지 준비",
-                name?.let { "앞 신호 · $it" } ?: "앞 신호")
+            if (Settings.canDrawOverlays(this)) {
+                showEdgeGlow(v.level)
+            } else {
+                val name = sit.ahead?.intersection?.name
+                showAlert(v.level, if (v.level == Level.CAUTION) "속도 줄이세요" else "정지 준비",
+                    name?.let { "앞 신호 · $it" } ?: "앞 신호")
+            }
         }
     }
 
@@ -755,6 +822,7 @@ class MainActivity : ComponentActivity() {
                     lifecycleScope.launch { delay(500); voice.stop(); voice.speak("정지 준비") }
                 }) { Text("🧪 겹침 B (끊고)") }
                 Button(onClick = { testPopup() }) { Text("🧪 팝업 (5초 뒤)") }
+                Button(onClick = { testEdgeGlow() }) { Text("🧪 테두리 (5초 뒤)") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // 서→동으로 달리다 달동사거리에서 좌회전(북쪽)하게 되는 목적지
