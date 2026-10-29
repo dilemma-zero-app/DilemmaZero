@@ -17,6 +17,9 @@ import android.car.hardware.property.CarPropertyManager
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -52,6 +55,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -229,6 +234,10 @@ class MainActivity : ComponentActivity() {
             if (denied.isNotEmpty() && isDrive) autoAsked = false
             startSensors()
         }
+    private val notifPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+            log("알림 권한 ${if (ok) "허용 → 팝업 테스트 다시 누르세요" else "거부"}")
+        }
     private val locationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
             val fused = result[FUSED_LOCATION_PERMISSION] == true
@@ -271,6 +280,43 @@ class MainActivity : ComponentActivity() {
 
         // 버튼 없이 바로 동작: 권한이 이미 있으면 그대로 시작, 없으면 한 번에 묻기
         autoStart()
+
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(ALERT_CHANNEL, "신호 안내", NotificationManager.IMPORTANCE_HIGH).apply {
+                setSound(null, null)   // 소리는 우리 음성 안내로만
+            }
+        )
+    }
+
+    // ================= 팝업 테스트 (10/29) =================
+    // 질문: 순정 내비를 보고 있을 때, 우리 앱이 화면 위에 짧은 팝업을 띄울 수 있나?
+
+    private fun testPopup() {
+        if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS)) {
+            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        log("🧪 5초 뒤 팝업 — 지금 내비 화면으로 가세요")
+        lifecycleScope.launch {
+            delay(5_000)
+            showAlert("정지 준비", "앞 신호 · 팝업 테스트")
+            voice.speak("정지 준비")
+        }
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun showAlert(title: String, text: String) {
+        val n = NotificationCompat.Builder(this, ALERT_CHANNEL)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setTimeoutAfter(4_000)   // 4초 뒤 저절로 사라짐
+            .setAutoCancel(true)
+            .build()
+        NotificationManagerCompat.from(this).notify(ALERT_ID, n)
+        log("🧪 팝업 보냄: $title")
     }
 
     // ================= 자동 시작 =================
@@ -686,6 +732,7 @@ class MainActivity : ComponentActivity() {
                     voice.speak("앞 신호, 속도 줄이세요")
                     lifecycleScope.launch { delay(500); voice.stop(); voice.speak("정지 준비") }
                 }) { Text("🧪 겹침 B (끊고)") }
+                Button(onClick = { testPopup() }) { Text("🧪 팝업 (5초 뒤)") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // 서→동으로 달리다 달동사거리에서 좌회전(북쪽)하게 되는 목적지
@@ -783,6 +830,8 @@ class MainActivity : ComponentActivity() {
         private const val MIN_GAP_MS = 3_000L    // 신호 전환 시 재호출 최소 간격
         private const val RETRY_BASE_MS = 5_000L // 실패 시 첫 재시도 간격
         private const val RETRY_MAX_MS = 30_000L // 실패 시 최대 재시도 간격
+        private const val ALERT_CHANNEL = "signal_alert"
+        private const val ALERT_ID = 1
         private const val FUSED_LOCATION_PERMISSION = "pleos.car.permission.FUSED_LOCATION"
         // 좌회전 테스트 목적지: 달동사거리(35.534043, 129.314474)에서 북쪽으로 약 450m
         private const val LEFT_TEST_LAT = 35.5381
