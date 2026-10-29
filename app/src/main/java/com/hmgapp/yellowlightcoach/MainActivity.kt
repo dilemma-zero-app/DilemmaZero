@@ -68,6 +68,13 @@ import com.hmgapp.yellowlightcoach.ui.theme.YellowLightCoachTheme
 import com.hmgapp.yellowlightcoach.voice.VoiceGuide
 import com.hmgapp.yellowlightcoach.navi.NaviWatcher
 import com.hmgapp.yellowlightcoach.coach.TurnIntent
+import com.hmgapp.yellowlightcoach.coach.AlertPolicy
+import com.hmgapp.yellowlightcoach.coach.DilemmaEvaluator
+import com.hmgapp.yellowlightcoach.coach.DriverProfile
+import com.hmgapp.yellowlightcoach.coach.FatigueTracker
+import com.hmgapp.yellowlightcoach.coach.Level
+import com.hmgapp.yellowlightcoach.coach.Situation
+import com.hmgapp.yellowlightcoach.coach.Verdict
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -131,13 +138,32 @@ class MainActivity : ComponentActivity() {
 
     // ---------- 순정 내비 (Pleos NaviHelper) ----------
     private lateinit var navi: NaviWatcher
+
+    // ---------- 판정 (3b단계) ----------
+    @Volatile private var speedMps = 0.0
+    @Volatile private var isDrive = false
+    private val fatigue = FatigueTracker()
+    private val policy = AlertPolicy()
+    private val profile = DriverProfile()          // 기본 모드 (반응 1.0초, 감속 3.0m/s²)
+    private val sitState = mutableStateOf<Situation?>(null)
+    private val verdict = mutableStateOf<Verdict?>(null)
+    private val intentText = mutableStateOf("-")
     private val beeper by lazy { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }
 
     private val logs = mutableStateListOf<String>()
 
     // ---------- Vehicle SDK 리스너 ----------
     private val gearListener = object : GearSelectionListener {
-        override fun onSelected(gear: VehicleGear?) = ui { gearText.value = gearLabel(gear) }
+        override fun onSelected(gear: VehicleGear?) = ui {
+            gearText.value = gearLabel(gear)
+            val now = SystemClock.elapsedRealtime()
+            isDrive = gear == VehicleGear.GEAR_DRIVE
+            fatigue.onGear(isDrive, now)
+            // 2시간 넘게 달린 뒤 P에서 한 번만 휴식 권유
+            if (!isDrive && fatigue.shouldRemindRest(now)) {
+                voice.speak("2시간째 운전 중이에요. 쉬었다 가세요")
+            }
+        }
         override fun onFailed(e: Exception) = log("기어 오류: ${e.message}")
     }
     private val brakeListener = object : BrakePedalStatusListener {
@@ -170,6 +196,7 @@ class MainActivity : ComponentActivity() {
     private val speedCallback = object : CarPropertyManager.CarPropertyEventCallback {
         override fun onChangeEvent(value: CarPropertyValue<*>) {
             val mps = value.value as? Float ?: return
+            speedMps = mps.toDouble()
             ui { speedText.value = "%.1f km/h".format(mps * 3.6f) }
         }
         override fun onErrorEvent(propId: Int, zone: Int) = log("속도 오류 propId=$propId")
@@ -268,6 +295,7 @@ class MainActivity : ComponentActivity() {
                         nextRefresh = now
                         continue
                     }
+                    coachTick(now)
                     tick.value = now
                     delay(250)
                 }
@@ -346,6 +374,47 @@ class MainActivity : ComponentActivity() {
             val x = repo.intersections[id] ?: return@forEach
             Log.d(tag, "COORD $id,$name,${x.lat},${x.lon}")
         }
+    }
+
+    // ================= 판정 + 음성 =================
+
+    /** 0.25초마다: 지금 상황 → 판정 → 필요하면 한 번 말하기 */
+    private fun coachTick(now: Long) {
+        // 회전 의도: 깜빡이(3초 확인)가 우선, 없으면 내비 TBT(거리·위치가 맞을 때만)
+        val signalIntent = turnTracker.intent(now)
+        val myFix = fix.value
+        val naviIntent = ahead.value?.let { a -> myFix?.let { f -> navi.turnAt(a.distanceM, f.lat, f.lon, now) } }
+        val intent = if (signalIntent != TurnIntent.NONE) signalIntent else naviIntent ?: TurnIntent.NONE
+        intentText.value = "$intent (출처: " + when {
+            signalIntent != TurnIntent.NONE -> "깜빡이"
+            naviIntent != null -> "내비 TBT"
+            else -> "-"
+        } + ")"
+
+        val sit = SituationBuilder.build(ahead.value, intent, turning.value, repo, now)
+        sitState.value = sit
+        val sig = sit.signal
+        val v = when {
+            !isDrive -> Verdict(Level.INACTIVE, "기어 D 아님")
+            sit.inactiveReason != null || sig == null || sit.stopLineM == null ->
+                Verdict(Level.INACTIVE, sit.inactiveReason ?: "신호 없음")
+            else -> DilemmaEvaluator.evaluate(
+                speedMps, sit.stopLineM, sig.phase, sig.remainingMs, profile, fatigue.factor(now)
+            )
+        }
+        verdict.value = v
+
+        val text = policy.next(sit.ahead?.intersection?.id, v.level) ?: return
+        log("🗣 ${v.level.label}: \"$text\" (${sit.ahead?.intersection?.name}, " +
+                "%.0fkm/h, 정지선 %.0fm, 녹색 %.1f초)".format(speedMps * 3.6, sit.stopLineM ?: 0.0, v.greenSec))
+        voice.speak(text)
+    }
+
+    private fun levelColor(l: Level) = when (l) {
+        Level.CALM -> Color(0xFF2E9D5B)
+        Level.CAUTION -> Color(0xFFE0A400)
+        Level.PREPARE_STOP -> Color(0xFFC8392F)
+        Level.INACTIVE -> Color.Gray
     }
 
     // ================= Car API =================
@@ -488,19 +557,10 @@ class MainActivity : ComponentActivity() {
             // 앞 교차로
             Spacer(Modifier.height(4.dp))
             Text("현재 위치: ${locationText.value}", fontSize = 15.sp)
-            // 회전 의도: 깜빡이(3초 확인)가 우선, 없으면 내비 TBT(앞 교차로 거리와 맞을 때)
-            val signalIntent = turnTracker.intent(now)
-            val myFix = fix.value
-            val naviIntent = ahead.value?.let { a -> myFix?.let { f -> navi.turnAt(a.distanceM, f.lat, f.lon, now) } }
-            val intent = if (signalIntent != TurnIntent.NONE) signalIntent else naviIntent ?: TurnIntent.NONE
-            val intentSource = when {
-                signalIntent != TurnIntent.NONE -> "깜빡이"
-                naviIntent != null -> "내비 TBT"
-                else -> "-"
-            }
-            val sit = SituationBuilder.build(ahead.value, intent, turning.value, repo, now)
-            Text("회전 판단: $intent (출처: $intentSource)", fontSize = 15.sp)
-            if (turnTracker.rawIntent != intent) {
+            // 판정은 coachTick()에서 0.25초마다 계산, 화면은 결과만 보여줌
+            val sit = sitState.value ?: SituationBuilder.build(ahead.value, TurnIntent.NONE, turning.value, repo, now)
+            Text("회전 판단: ${intentText.value}", fontSize = 15.sp)
+            if (turnTracker.rawIntent != TurnIntent.NONE && turnTracker.intent(now) == TurnIntent.NONE) {
                 Text("깜빡이 ${turnTracker.rawIntent} 확인 중… (3초 넘게 켜져 있으면 회전으로 판단)", fontSize = 15.sp, color = Color.Gray)
             }
             val a = sit.ahead
@@ -523,6 +583,23 @@ class MainActivity : ComponentActivity() {
                 sit.inactiveReason?.let { "⏸ 안내 멈춤: $it" } ?: "▶ 안내 가능",
                 fontSize = 17.sp, fontWeight = FontWeight.Bold,
                 color = if (sit.inactiveReason == null) Color(0xFF2E9D5B) else Color.Gray
+            )
+            verdict.value?.let { v ->
+                Text(
+                    "판정: ${v.level.label} — ${v.reason}",
+                    fontSize = 20.sp, fontWeight = FontWeight.Bold, color = levelColor(v.level)
+                )
+                if (v.comfortStopM > 0) {
+                    Text(
+                        "편안한 정지거리 %.0fm · 급제동 %.0fm · 정지선 도착 %.1f초 · 녹색(여유 뺀) %.1f초 · 황색 순간 남는 거리 %.0fm"
+                            .format(v.comfortStopM, v.hardStopM, v.arriveSec, v.greenSec, v.atYellowM),
+                        fontSize = 14.sp
+                    )
+                }
+            }
+            Text(
+                "연속 운전 %d분 · 피로 계수 %.1f".format(fatigue.drivingMs(now) / 60_000, fatigue.factor(now)),
+                fontSize = 14.sp
             )
 
             Spacer(Modifier.height(4.dp))
