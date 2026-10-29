@@ -112,7 +112,7 @@ class VoiceGuide(
     }
 
     companion object {
-        const val WARM_UP_TEXT = "노란불 코치를 시작합니다"
+        const val WARM_UP_TEXT = "딜레마 제로를 시작합니다"
     }
 
     fun release() {

@@ -24,7 +24,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -34,16 +36,20 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -142,6 +148,9 @@ class MainActivity : ComponentActivity() {
     // ---------- 판정 (3b단계) ----------
     @Volatile private var speedMps = 0.0
     @Volatile private var isDrive = false
+    /** 자동 시작: 권한 창을 이미 띄웠는지 / 위치 받는 중인지 */
+    private var autoAsked = false
+    private var trackerRunning = false
     private val fatigue = FatigueTracker()
     private val policy = AlertPolicy()
     private val profile = DriverProfile()          // 기본 모드 (반응 1.0초, 감속 3.0m/s²)
@@ -159,6 +168,8 @@ class MainActivity : ComponentActivity() {
             val now = SystemClock.elapsedRealtime()
             isDrive = gear == VehicleGear.GEAR_DRIVE
             fatigue.onGear(isDrive, now)
+            // 주행 중이라 권한 창이 막혔었다면, P가 되는 순간 다시 자동 시작
+            if (!isDrive && !autoAsked && !(speedSubscribed && trackerRunning)) autoStart()
             // 2시간 넘게 달린 뒤 P에서 한 번만 휴식 권유
             if (!isDrive && fatigue.shouldRemindRest(now)) {
                 voice.speak("2시간째 운전 중이에요. 쉬었다 가세요")
@@ -209,6 +220,15 @@ class MainActivity : ComponentActivity() {
             log("CAR_SPEED 권한 ${if (granted) "허용" else "거부"}")
             if (granted) subscribeSpeed()
         }
+    /** 앱 시작 때 한 번에 묻는 권한 창 (속도 + 위치 + 내비) */
+    private val allPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            val denied = result.filterValues { !it }.keys.map { it.substringAfterLast('.') }
+            log(if (denied.isEmpty()) "권한 모두 허용" else "권한 거부: $denied")
+            // 주행 중이라 창이 막혀 거부된 경우 → P가 되면 다시 묻기
+            if (denied.isNotEmpty() && isDrive) autoAsked = false
+            startSensors()
+        }
     private val locationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
             val fused = result[FUSED_LOCATION_PERMISSION] == true
@@ -242,9 +262,45 @@ class MainActivity : ComponentActivity() {
         setContent {
             YellowLightCoachTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    TestScreen(Modifier.padding(innerPadding))
+                    // 기본은 운전 화면, 개발 중 확인은 "개발자 보기"로
+                    if (devView.value) TestScreen(Modifier.padding(innerPadding))
+                    else DriveScreen(Modifier.padding(innerPadding))
                 }
             }
+        }
+
+        // 버튼 없이 바로 동작: 권한이 이미 있으면 그대로 시작, 없으면 한 번에 묻기
+        autoStart()
+    }
+
+    // ================= 자동 시작 =================
+
+    private val sensorPermissions get() = arrayOf(
+        Car.PERMISSION_SPEED,
+        FUSED_LOCATION_PERMISSION,
+        "pleos.car.permission.NAVI_ROUTE",
+        "pleos.car.permission.NAVI_ROUTE_SEARCH",
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+    )
+
+    private fun autoStart() {
+        if (!connectCar()) return
+        val need = sensorPermissions.filter { !granted(it) }
+        if (need.isEmpty()) {
+            startSensors()
+        } else if (!autoAsked) {
+            autoAsked = true
+            log("권한 요청: ${need.map { it.substringAfterLast('.') }}")
+            allPermissionLauncher.launch(need.toTypedArray())
+        }
+    }
+
+    /** 허용된 것만 시작 (속도·위치 각각) */
+    private fun startSensors() {
+        if (granted(Car.PERMISSION_SPEED)) subscribeSpeed()
+        if (!trackerRunning && (granted(FUSED_LOCATION_PERMISSION) || granted(Manifest.permission.ACCESS_FINE_LOCATION))) {
+            startTracker()
         }
     }
 
@@ -346,7 +402,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startTracker() {
+        if (trackerRunning) return
         val ok = tracker.start(useFused = granted(FUSED_LOCATION_PERMISSION))
+        trackerRunning = ok
         locationText.value = if (ok) "위치 기다리는 중… (${tracker.source})" else "❌ 위치를 받을 수 없어요"
         log(if (ok) "위치 받기 시작" else "GPS 꺼짐")
     }
@@ -419,20 +477,25 @@ class MainActivity : ComponentActivity() {
 
     // ================= Car API =================
 
-    private fun startCarSpeed() {
-        if (car == null) {
-            try {
-                val c = Car.createCar(this)
-                car = c
-                propertyManager = c.getCarManager(Car.PROPERTY_SERVICE) as? CarPropertyManager
-                uxManager = c.getCarManager(Car.CAR_UX_RESTRICTION_SERVICE) as? CarUxRestrictionsManager
-                uxManager?.currentCarUxRestrictions?.let { uxText.value = uxLabel(it) }
-                uxManager?.registerListener(uxListener)
-            } catch (e: Exception) {
-                log("Car 연결 실패: ${e.message}")
-                return
-            }
+    /** Car 서비스 연결 (한 번만). 실패하면 false */
+    private fun connectCar(): Boolean {
+        if (car != null) return true
+        return try {
+            val c = Car.createCar(this)
+            car = c
+            propertyManager = c.getCarManager(Car.PROPERTY_SERVICE) as? CarPropertyManager
+            uxManager = c.getCarManager(Car.CAR_UX_RESTRICTION_SERVICE) as? CarUxRestrictionsManager
+            uxManager?.currentCarUxRestrictions?.let { uxText.value = uxLabel(it) }
+            uxManager?.registerListener(uxListener)
+            true
+        } catch (e: Exception) {
+            log("Car 연결 실패: ${e.message}")
+            false
         }
+    }
+
+    private fun startCarSpeed() {
+        if (!connectCar()) return
         // 권한 요청은 반드시 주차(P) 상태에서 (주행 중엔 권한 창이 차단됨)
         if (ContextCompat.checkSelfPermission(this, Car.PERMISSION_SPEED) == PackageManager.PERMISSION_GRANTED) {
             subscribeSpeed()
@@ -513,6 +576,74 @@ class MainActivity : ComponentActivity() {
 
     // ================= 화면 =================
 
+    /** true = 개발자 보기(지금까지의 테스트 화면), false = 운전 화면 */
+    private val devView = mutableStateOf(false)
+
+    /**
+     * 운전 화면 — 한눈에 보이는 것 하나만
+     *  - 큰 배너: 상태 색 + 짧은 행동 문장 (음성과 같은 말)
+     *  - 숫자(남은 초)는 보여주지 않는다: "숫자를 보여주는 앱"이 아니라 "할 일을 알려주는 앱"
+     *  - 운전 중엔 버튼을 누를 일이 없게 (개발자 보기 버튼은 작게 구석에)
+     */
+    @Composable
+    private fun DriveScreen(modifier: Modifier) {
+        val now = tick.value
+        val v = verdict.value
+        val level = v?.level ?: Level.INACTIVE
+        val name = sitState.value?.ahead?.intersection?.name
+
+        val (bg, fg) = when (level) {
+            Level.PREPARE_STOP -> Color(0xFFD93B30) to Color.White
+            Level.CAUTION -> Color(0xFFF5B700) to Color(0xFF1A1A1A)
+            // 여유는 '조용한' 상태 → 어두운 초록 (밤에 화면 가득 밝은 초록은 눈부심·주의 분산)
+            Level.CALM -> Color(0xFF173B2B) to Color(0xFF7FD6A4)
+            Level.INACTIVE -> Color(0xFF3A3F45) to Color(0xFFD5D9DE)
+        }
+        val (main, sub) = when (level) {
+            Level.PREPARE_STOP -> "정지 준비" to (name?.let { "앞 신호 · $it" } ?: "앞 신호")
+            Level.CAUTION -> "속도 줄이세요" to (name?.let { "앞 신호 · $it" } ?: "앞 신호")
+            Level.CALM -> "여유" to (name?.let { "앞 신호 · $it" } ?: "")
+            Level.INACTIVE -> "대기" to when {
+                !isDrive -> "주차 중"
+                name == null -> "앞에 안내할 신호가 없어요"
+                else -> "$name · 지금은 안내하지 않아요"
+            }
+        }
+
+        Column(
+            modifier = modifier.fillMaxSize().background(Color(0xFF121417)).padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("딜레마 제로", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                Spacer(Modifier.width(16.dp))
+                Text("기어 ${gearText.value} · ${speedText.value}", fontSize = 16.sp, color = Color(0xFF9AA3AD),
+                    modifier = Modifier.weight(1f))
+                OutlinedButton(onClick = { devView.value = true }) { Text("개발자 보기", color = Color(0xFF9AA3AD)) }
+            }
+
+            Box(
+                modifier = Modifier.fillMaxWidth().weight(1f)
+                    .background(bg, RoundedCornerShape(28.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(main, fontSize = 88.sp, fontWeight = FontWeight.Black, color = fg, textAlign = TextAlign.Center)
+                    if (sub.isNotEmpty()) {
+                        Spacer(Modifier.height(12.dp))
+                        Text(sub, fontSize = 28.sp, fontWeight = FontWeight.SemiBold, color = fg.copy(alpha = 0.85f),
+                            textAlign = TextAlign.Center)
+                    }
+                }
+            }
+
+            Text(
+                "연속 운전 %d분".format(fatigue.drivingMs(now) / 60_000),
+                fontSize = 18.sp, color = Color(0xFF9AA3AD)
+            )
+        }
+    }
+
     @Composable
     private fun TestScreen(modifier: Modifier) {
         val now = tick.value   // 0.25초마다 바뀌어서 카운트다운이 다시 그려짐
@@ -523,7 +654,11 @@ class MainActivity : ComponentActivity() {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Text("노란불 코치 · 신호 데이터 연동 테스트", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("딜레마 제로 · 개발자 보기", fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f))
+                Button(onClick = { devView.value = false }) { Text("← 운전 화면") }
+            }
             Text(
                 "기어 ${gearText.value}  ·  브레이크 ${brakeText.value}  ·  조향 ${steeringText.value}  ·  " +
                         "깜빡이 ${turnSignalText.value}  ·  속도 ${speedText.value}  ·  주행 제한 ${uxText.value}",
