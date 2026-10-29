@@ -539,6 +539,19 @@ class MainActivity : ComponentActivity() {
                 Button(onClick = { voice.stop() }) { Text("■ 멈춤") }
                 Button(onClick = { log("🔔 삐 요청"); beeper.startTone(ToneGenerator.TONE_PROP_BEEP, 200) }) { Text("🔔 삐 (비교용)") }
             }
+            // 겹침 테스트: "주의"를 말하는 도중(0.5초 뒤) "정지 준비"가 들어오면?
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(onClick = {
+                    log("── 겹침 A: 그냥 이어서 요청")
+                    voice.speak("앞 신호, 속도 줄이세요")
+                    lifecycleScope.launch { delay(500); voice.speak("정지 준비") }
+                }) { Text("🧪 겹침 A (그냥)") }
+                Button(onClick = {
+                    log("── 겹침 B: 멈추고 요청")
+                    voice.speak("앞 신호, 속도 줄이세요")
+                    lifecycleScope.launch { delay(500); voice.stop(); voice.speak("정지 준비") }
+                }) { Text("🧪 겹침 B (끊고)") }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // 서→동으로 달리다 달동사거리에서 좌회전(북쪽)하게 되는 목적지
                 Button(onClick = { navi.requestRoute(LEFT_TEST_LAT, LEFT_TEST_LON, "좌회전 테스트") }) { Text("🧭 좌회전 경로 요청") }
