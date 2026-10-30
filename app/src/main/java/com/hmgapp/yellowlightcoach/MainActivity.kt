@@ -95,6 +95,7 @@ import com.hmgapp.yellowlightcoach.coach.AlertPolicy
 import com.hmgapp.yellowlightcoach.coach.DilemmaEvaluator
 import com.hmgapp.yellowlightcoach.coach.DriverProfile
 import com.hmgapp.yellowlightcoach.coach.FatigueTracker
+import com.hmgapp.yellowlightcoach.coach.PositionStallDetector
 import com.hmgapp.yellowlightcoach.coach.Level
 import com.hmgapp.yellowlightcoach.coach.Situation
 import com.hmgapp.yellowlightcoach.coach.Verdict
@@ -177,6 +178,11 @@ class MainActivity : ComponentActivity() {
     private var autoAsked = false
     private var trackerRunning = false
     private val fatigue = FatigueTracker()
+    private val stall = PositionStallDetector()
+    private var stallLogged = false
+    /** 주차(P)를 시작한 시각 — 5분 넘으면 신호 API 쉬기 (하루 5,000건 한도) */
+    @Volatile private var parkedSince = 0L
+    @Volatile private var resumeRefresh = false
     private var policy = AlertPolicy()
     private val profile = DriverProfile()          // 기본 모드 (반응 1.0초, 감속 3.0m/s²)
     private val sitState = mutableStateOf<Situation?>(null)
@@ -202,7 +208,9 @@ class MainActivity : ComponentActivity() {
     private fun applyGear(drive: Boolean, label: String) {
         gearText.value = label
         val now = SystemClock.elapsedRealtime()
+        if (drive && !isDrive && parkedSince != 0L) resumeRefresh = true   // 쉬다가 D → 바로 다시 받기
         isDrive = drive
+        parkedSince = if (drive) 0L else (if (parkedSince == 0L) now else parkedSince)
         fatigue.onGear(isDrive, now)
         recorder.gear(isDrive)
         // 2시간 넘게 달린 뒤 P에서 한 번만 휴식 권유
@@ -378,6 +386,7 @@ class MainActivity : ComponentActivity() {
         override fun onEnd() {
             // 실시간으로 되돌리기: 교차로·신호는 다음 호출에서 새로, 기어·속도는 실제 값으로
             repo.endReplay()
+            stall.reset()
             ahead.value = null
             policy = AlertPolicy()
             applyGear(liveDrive, liveGearLabel)
@@ -394,6 +403,7 @@ class MainActivity : ComponentActivity() {
         if (recorder.recording) recorder.stop()
         // 새 장면: 앞 교차로·안내 기록을 비우고 시작
         repo.beginReplay()
+        stall.reset()
         ahead.value = null
         policy = AlertPolicy()
         if (!replay.start(lifecycleScope, replaySink, useAsset)) repo.endReplay()
@@ -482,7 +492,7 @@ class MainActivity : ComponentActivity() {
         try {
             wm.addView(view, lp)
             glowView = view
-            log("🟥 테두리: ${level.label}")
+            log((if (level == Level.CAUTION) "🟨" else "🟥") + " 테두리: ${level.label}")
             lifecycleScope.launch {
                 delay(3_000)
                 if (glowView === view) {
@@ -559,8 +569,13 @@ class MainActivity : ComponentActivity() {
                 var failCount = 0
                 while (isActive) {
                     val now = SystemClock.elapsedRealtime()
+                    val restingInPark = !isDrive && parkedSince != 0L && now - parkedSince > PARK_REST_MS
+                    if (resumeRefresh) { resumeRefresh = false; nextRefresh = now }
                     if (replay.active) {
                         // 재생 중: 신호 API를 부르지 않고 기록된 신호만 사용
+                    } else if (restingInPark) {
+                        // 주차 5분 넘음: 신호 API 쉬기 (D가 되면 바로 다시 받음)
+                        signalStatus.value = "⏸ 주차 5분이 넘어 신호 받기를 쉬는 중 (D가 되면 다시) · 호출 ${repo.callCount}회"
                     } else if (now >= nextRefresh) {
                         // 성공·실패와 상관없이 "시도한 시각"을 기록 → 실패해도 연달아 부르지 않음
                         lastRefresh = now
@@ -654,6 +669,7 @@ class MainActivity : ComponentActivity() {
     private fun onFix(f: Fix) {
         fix.value = f
         recorder.fix(f)
+        stall.onFix(f.lat, f.lon, SystemClock.elapsedRealtime())
         val head = f.headingDeg?.let { "%s %.0f°".format(Geo.compass(it), it) } ?: "모름(움직이면 계산)"
         val sdk = f.sdkHeadingDeg?.let { " · SDK 방향 %.0f° (신뢰도 %.2f)".format(it, f.confidence ?: 0f) } ?: ""
         locationText.value = "[${f.source}] %.6f, %.6f · 계산 방향 %s%s".format(f.lat, f.lon, head, sdk)
@@ -695,8 +711,14 @@ class MainActivity : ComponentActivity() {
         val sit = SituationBuilder.build(ahead.value, intent, turning.value, repo, now)
         sitState.value = sit
         val sig = sit.signal
+        val stalled = stall.stalled(speedMps, now)
+        if (stalled != stallLogged) {
+            stallLogged = stalled
+            log(if (stalled) "⚠ 속도 %.0fkm/h인데 위치가 5초째 그대로 → 안내 멈춤".format(speedMps * 3.6) else "위치 다시 움직임 → 안내 재개")
+        }
         val v = when {
             !isDrive -> Verdict(Level.INACTIVE, "기어 D 아님")
+            stalled -> Verdict(Level.INACTIVE, "위치가 멈춤 (속도와 안 맞음)")
             sit.inactiveReason != null || sig == null || sit.stopLineM == null ->
                 Verdict(Level.INACTIVE, sit.inactiveReason ?: "신호 없음")
             else -> DilemmaEvaluator.evaluate(
@@ -977,6 +999,14 @@ class MainActivity : ComponentActivity() {
                 Text(replayLabel(now), fontSize = 15.sp,
                     color = if (replay.active) Color(0xFFB07800) else Color.Gray)
             }
+            // 테두리 권한 상태 (에뮬레이터를 새로 켜면 풀릴 수 있음)
+            if (Settings.canDrawOverlays(this@MainActivity)) {
+                Text("테두리 권한: 있음 ✓ (내비 위에 화면 테두리로 안내)", fontSize = 15.sp, color = Color(0xFF2E9D5B))
+            } else {
+                Text("테두리 권한: 없음 → 팝업으로 안내 중. 테두리로 바꾸려면 PowerShell:\n" +
+                        "adb shell appops set --user 10 com.hmgapp.yellowlightcoach SYSTEM_ALERT_WINDOW allow",
+                    fontSize = 15.sp, color = Color(0xFFB07800))
+            }
             val firstTbt = navi.tbtList.firstOrNull()
             Text(
                 "내비: ${if (navi.connected) "연결" else "미연결"} · 상태 ${navi.status ?: "-"} · 모드 ${navi.naviMode ?: "-"} · " +
@@ -1067,6 +1097,7 @@ class MainActivity : ComponentActivity() {
         private const val MIN_GAP_MS = 3_000L    // 신호 전환 시 재호출 최소 간격
         private const val RETRY_BASE_MS = 5_000L // 실패 시 첫 재시도 간격
         private const val RETRY_MAX_MS = 30_000L // 실패 시 최대 재시도 간격
+        private const val PARK_REST_MS = 5 * 60_000L // 주차가 이보다 길면 신호 API 쉬기
         private const val ALERT_CHANNEL = "signal_alert"
         private const val ALERT_ID = 1
         private const val FUSED_LOCATION_PERMISSION = "pleos.car.permission.FUSED_LOCATION"

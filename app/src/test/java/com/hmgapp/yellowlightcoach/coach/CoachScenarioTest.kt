@@ -119,6 +119,25 @@ class CoachScenarioTest {
         assertFalse(f.shouldRemindRest(132 * min))   // 한 번만
     }
 
+    // ---------------- 위치-속도 불일치 ----------------
+
+    @Test fun `60kmh인데 위치가 5초 넘게 그대로면 불일치`() {
+        val d = PositionStallDetector()
+        d.onFix(35.0, 129.0, 0)
+        assertFalse(d.stalled(kmh(60.0), 3_000))
+        d.onFix(35.0, 129.0, 3_000)                  // 같은 자리
+        assertTrue(d.stalled(kmh(60.0), 6_000))
+    }
+
+    @Test fun `잘 움직이면 불일치 아님 - 출발 직후엔 5초 여유`() {
+        val d = PositionStallDetector()
+        d.onFix(35.0, 129.0, 0)
+        assertFalse(d.stalled(0.0, 60_000))           // 1분 정차 (느리면 정상)
+        assertFalse(d.stalled(kmh(40.0), 62_000))     // 막 출발: 여유 시간 안
+        d.onFix(35.0002, 129.0, 63_000)              // 약 22m 이동
+        assertFalse(d.stalled(kmh(40.0), 66_000))
+    }
+
     // ---------------- 언제 말할지 ----------------
 
     @Test fun `같은 교차로에서는 더 위험해질 때만 한 번씩`() {
