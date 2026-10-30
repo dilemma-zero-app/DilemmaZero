@@ -386,7 +386,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun toggleReplay() {
+    private fun toggleReplay(useAsset: Boolean = false) {
         if (replay.active) {
             replay.stop(replaySink)
             return
@@ -396,7 +396,7 @@ class MainActivity : ComponentActivity() {
         repo.beginReplay()
         ahead.value = null
         policy = AlertPolicy()
-        if (!replay.start(lifecycleScope, replaySink)) repo.endReplay()
+        if (!replay.start(lifecycleScope, replaySink, useAsset)) repo.endReplay()
     }
 
     private fun replayLabel(now: Long): String {
@@ -565,6 +565,12 @@ class MainActivity : ComponentActivity() {
                         // 성공·실패와 상관없이 "시도한 시각"을 기록 → 실패해도 연달아 부르지 않음
                         lastRefresh = now
                         val ok = try {
+                            // 앱 시작 때 교차로 목록을 못 받았으면(네트워크 준비 전 등) 여기서 다시 받기
+                            // (10/30: 시작 직후 실패 → 교차로 0개로 계속 "앞 교차로 없음"이던 문제)
+                            if (repo.intersections.isEmpty()) {
+                                repo.loadIntersections()
+                                log("교차로 ${repo.intersections.size}개 받음 (다시 시도)")
+                            }
                             repo.refreshSignals()
                             recorder.signals(repo, fix.value?.lat, fix.value?.lon)
                             updateStatus()
@@ -964,6 +970,9 @@ class MainActivity : ComponentActivity() {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Button(onClick = { toggleReplay() }) {
                     Text(if (replay.active) "■ 재생 멈춤" else "▶ 기록 재생")
+                }
+                if (!replay.active) {
+                    Button(onClick = { toggleReplay(useAsset = true) }) { Text("▶ 시연 파일 재생") }
                 }
                 Text(replayLabel(now), fontSize = 15.sp,
                     color = if (replay.active) Color(0xFFB07800) else Color.Gray)

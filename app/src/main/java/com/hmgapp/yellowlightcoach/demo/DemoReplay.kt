@@ -23,7 +23,7 @@ import java.io.File
  * 신호 API·GPS·차량 신호 대신 파일의 값을 쓰므로, 몇 번을 틀어도 같은 장면이 나온다.
  * (심사 당일 신호·네트워크·에뮬레이터 상태에 영향받지 않음)
  *
- * 무엇을 틀까: 앱 안의 마지막 기록 → 없으면 앱에 포함한 시연 파일(assets/demo.jsonl)
+ * 무엇을 틀까: [▶ 기록 재생] 앱 안의 마지막 기록(없으면 시연 파일) / [▶ 시연 파일 재생] assets/demo.jsonl
  */
 class DemoReplay(private val context: Context, private val log: (String) -> Unit) {
 
@@ -58,9 +58,9 @@ class DemoReplay(private val context: Context, private val log: (String) -> Unit
             ?.maxByOrNull { it.name }
 
     /** 재생 시작. 틀 파일이 없으면 false */
-    fun start(scope: CoroutineScope, sink: Sink): Boolean {
+    fun start(scope: CoroutineScope, sink: Sink, useAsset: Boolean = false): Boolean {
         if (active) return true
-        val (name, lines) = load() ?: run { log("❌ 재생할 기록이 없어요"); return false }
+        val (name, lines) = load(useAsset) ?: run { log("❌ 재생할 기록이 없어요"); return false }
         val events = lines.mapNotNull { runCatching { JSONObject(it) }.getOrNull() }
         if (events.isEmpty()) { log("❌ 기록이 비어 있어요: $name"); return false }
         sourceName = name
@@ -143,9 +143,9 @@ class DemoReplay(private val context: Context, private val log: (String) -> Unit
     private fun JSONObject.optNullableDouble(key: String): Double? =
         if (!has(key) || isNull(key)) null else getDouble(key)
 
-    /** 앱 안의 마지막 기록, 없으면 assets/demo.jsonl */
-    private fun load(): Pair<String, List<String>>? {
-        latestRecording()?.let { f -> return f.name to f.readLines() }
+    /** useAsset = true면 시연 파일(assets/demo.jsonl)만, 아니면 앱 안의 마지막 기록 → 없으면 시연 파일 */
+    private fun load(useAsset: Boolean): Pair<String, List<String>>? {
+        if (!useAsset) latestRecording()?.let { f -> return f.name to f.readLines() }
         return try {
             context.assets.open(ASSET_NAME).bufferedReader().use { ASSET_NAME to it.readLines() }
         } catch (e: Exception) {
