@@ -96,6 +96,8 @@ import com.hmgapp.yellowlightcoach.coach.DilemmaEvaluator
 import com.hmgapp.yellowlightcoach.coach.DriverProfile
 import com.hmgapp.yellowlightcoach.coach.FatigueTracker
 import com.hmgapp.yellowlightcoach.coach.PositionStallDetector
+import com.hmgapp.yellowlightcoach.coach.DriveMode
+import com.hmgapp.yellowlightcoach.coach.TripScore
 import com.hmgapp.yellowlightcoach.coach.Level
 import com.hmgapp.yellowlightcoach.coach.Situation
 import com.hmgapp.yellowlightcoach.coach.Verdict
@@ -184,7 +186,12 @@ class MainActivity : ComponentActivity() {
     @Volatile private var parkedSince = 0L
     @Volatile private var resumeRefresh = false
     private var policy = AlertPolicy()
-    private val profile = DriverProfile()          // 기본 모드 (반응 1.0초, 감속 3.0m/s²)
+    /** 운전자 모드 (주차 중에만 바꿀 수 있음, 앱을 다시 켜도 유지) */
+    private val driveMode = mutableStateOf(DriveMode.STANDARD)
+    private val profile get() = driveMode.value.profile
+    /** 교차로 안전 점수 (이번 주행) — 주차하면 요약 */
+    private val trip = TripScore()
+    private val tripSummary = mutableStateOf<TripScore.Summary?>(null)
     private val sitState = mutableStateOf<Situation?>(null)
     private val verdict = mutableStateOf<Verdict?>(null)
     private val intentText = mutableStateOf("-")
@@ -209,6 +216,18 @@ class MainActivity : ComponentActivity() {
         gearText.value = label
         val now = SystemClock.elapsedRealtime()
         if (drive && !isDrive && parkedSince != 0L) resumeRefresh = true   // 쉬다가 D → 바로 다시 받기
+        // 새 주행 시작: 처음이거나 30초 넘게 주차했다가 D
+        if (drive && !isDrive && (!trip.started || (parkedSince != 0L && now - parkedSince > 30_000))) {
+            trip.startTrip()
+            tripSummary.value = null
+        }
+        // 주차: 이번 주행 요약 (교차로를 하나 이상 지났을 때만 화면에)
+        if (!drive && isDrive && trip.started) {
+            val sm = trip.summary()
+            tripSummary.value = sm
+            log("🏁 주행 요약: 교차로 ${sm.intersections}곳 · 주의 ${sm.cautions} · 정지 준비 ${sm.prepares} · " +
+                    "황색·적색 진입 ${sm.redYellowEntries} · 급정거 ${sm.hardBrakes} · 점수 ${sm.score ?: "-"}")
+        }
         isDrive = drive
         parkedSince = if (drive) 0L else (if (parkedSince == 0L) now else parkedSince)
         fatigue.onGear(isDrive, now)
@@ -307,6 +326,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         log("앱 시작")
+        driveMode.value = runCatching {
+            DriveMode.valueOf(getSharedPreferences("dz", MODE_PRIVATE).getString("mode", null) ?: "STANDARD")
+        }.getOrDefault(DriveMode.STANDARD)
         // 차량 리스너보다 먼저 만들어야 함 (리스너가 등록 즉시 불릴 수 있음)
         recorder = DemoRecorder(this) { msg -> log(msg) }
         replay = DemoReplay(this) { msg -> log(msg) }
@@ -368,6 +390,13 @@ class MainActivity : ComponentActivity() {
         if (!recorder.recording) return recorder.file?.let { "마지막 기록: ${it.name}" } ?: "기록 없음"
         val sec = recorder.elapsedMs(now) / 1000
         return "● 기록 중 %d:%02d · %d줄 · %s".format(sec / 60, sec % 60, recorder.lineCount, recorder.file?.name ?: "")
+    }
+
+    private fun setMode(m: DriveMode) {
+        if (isDrive) return   // 주행 중엔 바꾸지 않음
+        driveMode.value = m
+        getSharedPreferences("dz", MODE_PRIVATE).edit().putString("mode", m.name).apply()
+        log("안내 모드: ${m.label}")
     }
 
     // ================= 4단계: 재생 =================
@@ -726,8 +755,10 @@ class MainActivity : ComponentActivity() {
             )
         }
         verdict.value = v
+        if (isDrive) trip.onTick(sit.ahead?.intersection?.id, sit.stopLineM, sig?.phase, speedMps, now)
 
         val text = policy.next(sit.ahead?.intersection?.id, v.level) ?: return
+        trip.onAlert(v.level)
         log("🗣 ${v.level.label}: \"$text\" (${sit.ahead?.intersection?.name}, " +
                 "%.0fkm/h, 정지선 %.0fm, 녹색 %.1f초)".format(speedMps * 3.6, sit.stopLineM ?: 0.0, v.greenSec))
         voice.speak(text)
@@ -906,10 +937,16 @@ class MainActivity : ComponentActivity() {
                     Text("▶ 시연용 재생 데이터", fontSize = 16.sp, color = Color(0xFFF5B700), fontWeight = FontWeight.Bold)
                     Spacer(Modifier.width(12.dp))
                 }
-                OutlinedButton(onClick = { devView.value = true }) { Text("개발자 보기", color = Color(0xFF9AA3AD)) }
+                // 주행 중에는 조작할 버튼을 보이지 않음 (주차 중에만)
+                if (!isDrive) {
+                    OutlinedButton(onClick = { devView.value = true }) { Text("개발자 보기", color = Color(0xFF9AA3AD)) }
+                }
             }
 
-            Box(
+            val sm = tripSummary.value
+            if (!isDrive && sm?.score != null) {
+                TripSummaryCard(sm, Modifier.fillMaxWidth().weight(1f))
+            } else Box(
                 modifier = Modifier.fillMaxWidth().weight(1f)
                     .background(bg, RoundedCornerShape(28.dp)),
                 contentAlignment = Alignment.Center
@@ -924,10 +961,43 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // 주차 중에만: 안내 모드 선택
+            if (!isDrive) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("안내 모드", fontSize = 18.sp, color = Color(0xFF9AA3AD))
+                    DriveMode.values().forEach { m ->
+                        if (m == driveMode.value) {
+                            Button(onClick = { setMode(m) }) { Text(m.label, fontSize = 16.sp) }
+                        } else {
+                            OutlinedButton(onClick = { setMode(m) }) { Text(m.label, fontSize = 16.sp, color = Color(0xFF9AA3AD)) }
+                        }
+                    }
+                    Text(if (driveMode.value == DriveMode.RELAXED) "더 일찍 알려줘요" else "",
+                        fontSize = 16.sp, color = Color(0xFF9AA3AD))
+                }
+            }
             Text(
-                "연속 운전 %d분".format(fatigue.drivingMs(now) / 60_000),
+                "연속 운전 %d분 · 안내 모드 %s".format(fatigue.drivingMs(now) / 60_000, driveMode.value.label),
                 fontSize = 18.sp, color = Color(0xFF9AA3AD)
             )
+        }
+    }
+
+    /** 주차 중 이번 주행 요약 (배너 대신) */
+    @Composable
+    private fun TripSummaryCard(sm: TripScore.Summary, modifier: Modifier) {
+        Box(
+            modifier = modifier.background(Color(0xFF1E2A38), RoundedCornerShape(28.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("이번 주행 교차로 안전 점수", fontSize = 26.sp, color = Color(0xFFB8C4D2))
+                Text("${sm.score}점", fontSize = 96.sp, fontWeight = FontWeight.Black, color = Color.White)
+                Text("신호 교차로 ${sm.intersections}곳 · 미리 안내 ${sm.cautions + sm.prepares}번",
+                    fontSize = 26.sp, color = Color(0xFFD5D9DE))
+                Text("황색·적색 진입 ${sm.redYellowEntries}번 · 급정거 ${sm.hardBrakes}번",
+                    fontSize = 26.sp, color = if (sm.redYellowEntries + sm.hardBrakes == 0) Color(0xFF7FD6A4) else Color(0xFFF5B700))
+            }
         }
     }
 

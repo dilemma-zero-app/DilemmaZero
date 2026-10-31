@@ -138,6 +138,36 @@ class CoachScenarioTest {
         assertFalse(d.stalled(kmh(40.0), 66_000))
     }
 
+    // ---------------- 운전자 모드 · 안전 점수 ----------------
+
+    @Test fun `여유 모드는 같은 상황에서 더 일찍 안내`() {
+        assertEquals(Level.CALM, judge(40.0, 80.0, Phase.GREEN, 5_000, DriveMode.STANDARD.profile))
+        assertEquals(Level.CAUTION, judge(40.0, 80.0, Phase.GREEN, 5_000, DriveMode.RELAXED.profile))
+    }
+
+    @Test fun `녹색에 통과하면 점수 100 - 황색에 넘으면 감점`() {
+        val t = TripScore(); t.startTrip()
+        var now = 0L
+        // 교차로 A: 정지선 30 → 0 → 지나감 (녹색)
+        for (d in listOf(30.0, 20.0, 10.0, 0.0, -10.0)) { t.onTick("A", d, Phase.GREEN, kmh(50.0), now); now += 250 }
+        assertEquals(100, t.summary().score)
+        // 교차로 B: 황색에 넘음
+        for (d in listOf(30.0, 10.0, -5.0)) { t.onTick("B", d, Phase.YELLOW, kmh(50.0), now); now += 250 }
+        val s = t.summary()
+        assertEquals(2, s.intersections)
+        assertEquals(1, s.redYellowEntries)
+        assertEquals(70, s.score)   // 100 − 60 × 1/2
+    }
+
+    @Test fun `급정거는 1초에 4m_s2 넘게 줄면 한 번`() {
+        val t = TripScore(); t.startTrip()
+        t.onTick(null, null, null, kmh(60.0), 0)
+        t.onTick(null, null, null, kmh(40.0), 1_000)   // 1초에 약 5.6 m/s² 감속
+        t.onTick(null, null, null, kmh(20.0), 2_000)   // 3초 안이라 중복 제외
+        t.onTick(null, null, null, kmh(15.0), 6_000)   // 부드러운 감속
+        assertEquals(1, t.summary().hardBrakes)
+    }
+
     // ---------------- 언제 말할지 ----------------
 
     @Test fun `같은 교차로에서는 더 위험해질 때만 한 번씩`() {
