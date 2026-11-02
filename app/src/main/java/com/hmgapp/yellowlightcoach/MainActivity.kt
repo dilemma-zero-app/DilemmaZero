@@ -98,6 +98,7 @@ import com.hmgapp.yellowlightcoach.coach.FatigueTracker
 import com.hmgapp.yellowlightcoach.coach.PositionStallDetector
 import com.hmgapp.yellowlightcoach.coach.DriveMode
 import com.hmgapp.yellowlightcoach.coach.TripScore
+import com.hmgapp.yellowlightcoach.coach.BrakeLearner
 import com.hmgapp.yellowlightcoach.coach.Level
 import com.hmgapp.yellowlightcoach.coach.Situation
 import com.hmgapp.yellowlightcoach.coach.Verdict
@@ -192,6 +193,9 @@ class MainActivity : ComponentActivity() {
     /** 교차로 안전 점수 (이번 주행) — 주차하면 요약 */
     private val trip = TripScore()
     private val tripSummary = mutableStateOf<TripScore.Summary?>(null)
+    // 6단계: 브레이크 습관 기록 (반응시간·편안한 감속도)
+    private val brake = BrakeLearner()
+    private val brakeStats = mutableStateOf(BrakeLearner.Stats())
     private val sitState = mutableStateOf<Situation?>(null)
     private val verdict = mutableStateOf<Verdict?>(null)
     private val intentText = mutableStateOf("-")
@@ -258,12 +262,18 @@ class MainActivity : ComponentActivity() {
     private fun applySpeed(mps: Double) {
         speedMps = mps
         recorder.speed(mps)
-        ui { speedText.value = "%.1f km/h".format(mps * 3.6) }
+        ui {
+            speedText.value = "%.1f km/h".format(mps * 3.6)
+            if (!replay.active) brakeLog(brake.onSpeed(mps, SystemClock.elapsedRealtime()))
+        }
     }
 
     private val brakeListener = object : BrakePedalStatusListener {
         override fun onBrakePedalStatusUpdated(status: Boolean?) =
-            ui { brakeText.value = if (status == true) "🟥 밟음" else "⬜ 뗌" }
+            ui {
+                brakeText.value = if (status == true) "🟥 밟음" else "⬜ 뗌"
+                if (!replay.active) brakeLog(brake.onBrake(status == true, speedMps, SystemClock.elapsedRealtime()))
+            }
         override fun onFailed(e: Exception) = log("브레이크 오류: ${e.message}")
     }
     private val steeringListener = object : SteeringWheelAngleListener {
@@ -329,6 +339,7 @@ class MainActivity : ComponentActivity() {
         driveMode.value = runCatching {
             DriveMode.valueOf(getSharedPreferences("dz", MODE_PRIVATE).getString("mode", null) ?: "STANDARD")
         }.getOrDefault(DriveMode.STANDARD)
+        loadBrake()
         // 차량 리스너보다 먼저 만들어야 함 (리스너가 등록 즉시 불릴 수 있음)
         recorder = DemoRecorder(this) { msg -> log(msg) }
         replay = DemoReplay(this) { msg -> log(msg) }
@@ -398,6 +409,63 @@ class MainActivity : ComponentActivity() {
         getSharedPreferences("dz", MODE_PRIVATE).edit().putString("mode", m.name).apply()
         log("안내 모드: ${m.label}")
     }
+
+
+        // ---------- 6단계: 브레이크 습관 저장 ----------
+        private fun loadBrake() {
+            val p = getSharedPreferences("dz", MODE_PRIVATE)
+            brake.stats = BrakeLearner.Stats(
+                reactionSec = if (p.contains("br_rt")) p.getFloat("br_rt", 0f).toDouble() else null,
+                reactionCount = p.getInt("br_rtn", 0),
+                decel = if (p.contains("br_a")) p.getFloat("br_a", 0f).toDouble() else null,
+                decelCount = p.getInt("br_an", 0),
+                ignoredCount = p.getInt("br_ign", 0)
+            )
+            brakeStats.value = brake.stats
+        }
+
+        private fun saveBrake() {
+            val s = brake.stats
+            getSharedPreferences("dz", MODE_PRIVATE).edit().apply {
+                if (s.reactionSec != null) putFloat("br_rt", s.reactionSec.toFloat()) else remove("br_rt")
+                putInt("br_rtn", s.reactionCount)
+                if (s.decel != null) putFloat("br_a", s.decel.toFloat()) else remove("br_a")
+                putInt("br_an", s.decelCount)
+                putInt("br_ign", s.ignoredCount)
+            }.apply()
+        }
+
+        /** 브레이크 기록 결과를 로그에 남기고 저장 */
+        private fun brakeLog(msg: String?) {
+            if (msg == null) return
+            log("🦶 $msg")
+            brakeStats.value = brake.stats
+            saveBrake()
+        }
+
+        private fun resetBrake() {
+            brake.reset()
+            brakeStats.value = brake.stats
+            saveBrake()
+            log("🦶 브레이크 기록 지움")
+        }
+
+        /** 주차 중: 내 브레이크 습관 (6단계) */
+        @Composable
+        private fun BrakeHabitLine() {
+            val s = brakeStats.value
+            val text = if (s.reactionSec == null && s.decel == null) {
+                "내 브레이크 습관 · 아직 기록 없음 (안내 뒤 브레이크를 밟으면 기록돼요)"
+            } else {
+                val rt = s.reactionSec?.let { "반응시간 %.1f초".format(it) } ?: "반응시간 -"
+                val a = s.decel?.let { "편안한 감속 %.1f".format(it) } ?: "편안한 감속 -"
+                val n = minOf(s.reactionCount, s.decelCount)
+                "내 브레이크 습관 · $rt · $a · " +
+                        if (s.learned) "학습됨" else "기록 ${n}/${BrakeLearner.MIN_SAMPLES}"
+            }
+            Text(text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
+                color = if (s.learned) Color(0xFF7FD6A4) else Color(0xFFD5D9DE))
+        }
 
     // ================= 4단계: 재생 =================
 
@@ -759,6 +827,10 @@ class MainActivity : ComponentActivity() {
 
         val text = policy.next(sit.ahead?.intersection?.id, v.level) ?: return
         trip.onAlert(v.level)
+        if (!replay.active) {
+            brake.base = profile
+            brakeLog(brake.onAlert(SystemClock.elapsedRealtime(), speedMps))
+        }
         log("🗣 ${v.level.label}: \"$text\" (${sit.ahead?.intersection?.name}, " +
                 "%.0fkm/h, 정지선 %.0fm, 녹색 %.1f초)".format(speedMps * 3.6, sit.stopLineM ?: 0.0, v.greenSec))
         voice.speak(text)
@@ -976,6 +1048,7 @@ class MainActivity : ComponentActivity() {
                         fontSize = 16.sp, color = Color(0xFF9AA3AD))
                 }
             }
+            if (!isDrive) BrakeHabitLine()
             Text(
                 "연속 운전 %d분 · 안내 모드 %s".format(fatigue.drivingMs(now) / 60_000, driveMode.value.label),
                 fontSize = 18.sp, color = Color(0xFF9AA3AD)
@@ -1068,6 +1141,24 @@ class MainActivity : ComponentActivity() {
                 }
                 Text(replayLabel(now), fontSize = 15.sp,
                     color = if (replay.active) Color(0xFFB07800) else Color.Gray)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = {
+                    // 시험용: 지금 속도에서 "주의" 안내가 나간 것처럼 (신호를 기다리지 않고 브레이크 기록 시험)
+                    if (speedMps < BrakeLearner.MIN_SPEED_MPS) {
+                        log("🦶 안내 흉내는 20km/h 이상에서 눌러 주세요 (지금 %.0fkm/h)".format(speedMps * 3.6))
+                    } else {
+                        brake.base = profile
+                        brakeLog(brake.onAlert(SystemClock.elapsedRealtime(), speedMps)
+                            ?: "안내 흉내 (%.0fkm/h) → 브레이크를 밟아 보세요".format(speedMps * 3.6))
+                        voice.speak("앞 신호, 속도 줄이세요")
+                    }
+                }) { Text("🦶 안내 흉내") }
+                Button(onClick = { resetBrake() }) { Text("🦶 브레이크 기록 지우기") }
+                val b = brakeStats.value
+                Text("반응 ${b.reactionSec?.let { "%.2f초".format(it) } ?: "-"} (${b.reactionCount}번) · " +
+                        "감속 ${b.decel?.let { "%.2f".format(it) } ?: "-"} (${b.decelCount}번) · 안내 무시 ${b.ignoredCount}번",
+                    fontSize = 15.sp, color = Color.Gray)
             }
             // 테두리 권한 상태 (에뮬레이터를 새로 켜면 풀릴 수 있음)
             if (Settings.canDrawOverlays(this@MainActivity)) {
