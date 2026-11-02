@@ -9,7 +9,7 @@ package com.hmgapp.yellowlightcoach.coach
  *
  * 새 값이 들어올 때마다 조금씩 반영한다 (지수 이동평균, 0.8 × 기존 + 0.2 × 새 값).
  * 첫 값의 "기존"은 지금 고른 안내 모드 값(base)에서 시작한다.
- * 1차 제출: 기록 + 주차 화면 표시만. 판정에 자동 반영은 PT 버전.
+ * 5번 넘게 모이면(학습됨) 판정에도 반영 — 단, 안내가 더 일찍 나오는 쪽으로만 (judgeProfile).
  *
  * 순수 계산 (안드로이드 없음) → 단위 테스트 가능. 모든 함수는 기록 문구(로그용)나 null을 돌려준다.
  */
@@ -100,6 +100,20 @@ class BrakeLearner(var stats: Stats = Stats()) {
         stats = s.copy(decel = v, decelCount = s.decelCount + 1)
         return "감속 %.1f m/s² 기록 (%.0f→%.0fkm/h, %.1f초) → 내 편안한 감속 %.2f (%d번째)"
             .format(a, stopStartV * 3.6, speedMps * 3.6, dt, v, stats.decelCount)
+    }
+
+    /**
+     * 판정에 쓸 값 (11/2): "학습됨"일 때만, 안내가 **더 일찍** 나오는 쪽으로만 반영
+     *   반응시간 = max(모드 값, 내 값),  감속도 = min(모드 값, 내 값)
+     * → 반응이 빠르고 세게 서는 사람이라도 안내가 모드 기준보다 늦어지는 일은 없다
+     */
+    fun judgeProfile(mode: DriverProfile): DriverProfile {
+        val s = stats
+        if (!s.learned) return mode
+        return mode.copy(
+            reactionSec = maxOf(mode.reactionSec, s.reactionSec ?: mode.reactionSec),
+            comfortDecel = minOf(mode.comfortDecel, s.decel ?: mode.comfortDecel)
+        )
     }
 
     /** 기록 모두 지우기 (개발자 보기) */

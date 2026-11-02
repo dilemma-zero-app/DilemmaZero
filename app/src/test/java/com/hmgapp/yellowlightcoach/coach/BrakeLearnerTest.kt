@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import com.hmgapp.yellowlightcoach.signal.Phase
 
 /**
  * 브레이크 습관 기록 테스트 (6단계)
@@ -115,6 +116,34 @@ class BrakeLearnerTest {
         b.onAlert(0, kmh(60.0))
         b.onBrake(true, kmh(60.0), 1_000)
         assertEquals(0.8 * 1.5 + 0.2 * 1.0, b.stats.reactionSec!!, 1e-9)
+    }
+
+    // ---------- 판정에 반영 (학습됨일 때만, 더 일찍 안내하는 쪽으로만) ----------
+
+    private val std = DriveMode.STANDARD.profile   // 1.0초 · 3.0
+
+    @Test fun `학습 전에는 판정에 모드 값 그대로`() {
+        val b = BrakeLearner(BrakeLearner.Stats(reactionSec = 1.7, reactionCount = 4, decel = 2.4, decelCount = 4))
+        assertEquals(std, b.judgeProfile(std))
+    }
+
+    @Test fun `반응이 느리고 살살 서는 사람은 학습 후 더 일찍 안내`() {
+        val b = BrakeLearner(BrakeLearner.Stats(reactionSec = 1.7, reactionCount = 5, decel = 2.4, decelCount = 5))
+        val p = b.judgeProfile(std)
+        assertEquals(1.7, p.reactionSec, 1e-9)
+        assertEquals(2.4, p.comfortDecel, 1e-9)
+        // 40km/h · 정지선 80m · 녹색 5초: 모드 값이면 여유, 내 값이면 주의
+        assertEquals(Level.CALM, DilemmaEvaluator.evaluate(kmh(40.0), 80.0, Phase.GREEN, 5_000, std, 1.0).level)
+        assertEquals(Level.CAUTION, DilemmaEvaluator.evaluate(kmh(40.0), 80.0, Phase.GREEN, 5_000, p, 1.0).level)
+    }
+
+    @Test fun `반응이 빠르고 세게 서는 사람도 안내가 늦어지지 않음`() {
+        val b = BrakeLearner(BrakeLearner.Stats(reactionSec = 0.8, reactionCount = 9, decel = 3.4, decelCount = 9))
+        assertEquals(std, b.judgeProfile(std))                     // 기본보다 늦게 만들지 않음
+        val mixed = BrakeLearner(BrakeLearner.Stats(reactionSec = 1.4, reactionCount = 5, decel = 3.4, decelCount = 5))
+        val p = mixed.judgeProfile(std)
+        assertEquals(1.4, p.reactionSec, 1e-9)                    // 느린 쪽만 반영
+        assertEquals(3.0, p.comfortDecel, 1e-9)                   // 센 쪽은 반영 안 함
     }
 
     private fun assertNotNullMsg(s: String?) = assertTrue(s != null)

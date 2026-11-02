@@ -190,6 +190,8 @@ class MainActivity : ComponentActivity() {
     /** 운전자 모드 (주차 중에만 바꿀 수 있음, 앱을 다시 켜도 유지) */
     private val driveMode = mutableStateOf(DriveMode.STANDARD)
     private val profile get() = driveMode.value.profile
+    /** 판정에 쓰는 값: 브레이크 습관이 "학습됨"이면 더 일찍 안내하는 쪽으로만 반영, 시연 재생 중엔 모드 값 그대로 */
+    private val judgeProfile get() = if (replay.active) profile else brake.judgeProfile(profile)
     /** 교차로 안전 점수 (이번 주행) — 주차하면 요약 */
     private val trip = TripScore()
     private val tripSummary = mutableStateOf<TripScore.Summary?>(null)
@@ -461,7 +463,11 @@ class MainActivity : ComponentActivity() {
                 val a = s.decel?.let { "편안한 감속 %.1f".format(it) } ?: "편안한 감속 -"
                 val n = minOf(s.reactionCount, s.decelCount)
                 "내 브레이크 습관 · $rt · $a · " +
-                        if (s.learned) "학습됨" else "기록 ${n}/${BrakeLearner.MIN_SAMPLES}"
+                        when {
+                            !s.learned -> "기록 ${n}/${BrakeLearner.MIN_SAMPLES}"
+                            brake.judgeProfile(profile) != profile -> "학습됨 · 안내를 더 일찍"
+                            else -> "학습됨 · 기본 시점 유지"
+                        }
             }
             Text(text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
                 color = if (s.learned) Color(0xFF7FD6A4) else Color(0xFFD5D9DE))
@@ -819,7 +825,7 @@ class MainActivity : ComponentActivity() {
             sit.inactiveReason != null || sig == null || sit.stopLineM == null ->
                 Verdict(Level.INACTIVE, sit.inactiveReason ?: "신호 없음")
             else -> DilemmaEvaluator.evaluate(
-                speedMps, sit.stopLineM, sig.phase, sig.remainingMs, profile, fatigue.factor(now)
+                speedMps, sit.stopLineM, sig.phase, sig.remainingMs, judgeProfile, fatigue.factor(now)
             )
         }
         verdict.value = v
