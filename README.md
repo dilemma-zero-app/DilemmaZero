@@ -26,7 +26,7 @@
 
 1. Pleos Connect 에뮬레이터를 켜고 APK를 설치합니다.
    ```
-   adb install -r apk/<APK 파일명>.apk
+   adb install -r "apk/앵두나무_딜레마제로_release.apk"
    ```
 2. 기어 **P** 상태에서 앱 **딜레마 제로**를 실행하고, 권한 창이 뜨면 모두 허용합니다.
 3. (선택) 순정 내비 위 **테두리 안내**를 보려면 아래 명령을 한 번 실행합니다. 실행하지 않으면 테두리 대신 알림 팝업으로 안내합니다.
@@ -90,7 +90,7 @@
 
 ## 4. APK 위치
 
-- `apk/<APK 파일명>.apk` (release 빌드)
+- `apk/앵두나무_딜레마제로_release.apk` (release 서명 빌드, 약 43MB)
 
 ## 5. 구조
 
